@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+# Microsoft's official Playwright image: Python 3.11 + Chromium + system deps
+# preinstalled. Pin the tag to match the playwright version in pyproject.toml.
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -7,14 +9,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN pip install --upgrade pip && pip install .
+
+# The base image already has chromium; no `playwright install` needed.
 
 EXPOSE 8080
 

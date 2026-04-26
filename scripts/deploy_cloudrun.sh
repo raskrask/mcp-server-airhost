@@ -17,6 +17,8 @@ SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 echo "Building image with Cloud Build..."
 gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "${PROJECT_ID}"
 
+# Playwright + Chromium needs significantly more memory and CPU than a plain
+# Python service. 2Gi / 2 vCPU is a safe starting point; tune down later.
 DEPLOY_ARGS=(
   "${SERVICE}"
   --image "gcr.io/${PROJECT_ID}/${SERVICE}:latest"
@@ -28,8 +30,10 @@ DEPLOY_ARGS=(
   --min-instances 0
   --max-instances 2
   --concurrency 4
-  --memory 512Mi
-  --set-env-vars "SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET}"
+  --cpu 2
+  --memory 2Gi
+  --timeout 300
+  --set-env-vars "SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
 )
 
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then

@@ -2,7 +2,7 @@
 
 Airhost 操作用の MCP サーバ。Claude（リモート MCP）から呼び出せる Streamable HTTP transport で公開し、Cloud Run にデプロイして使う想定。
 
-> **現状はモック**。`AIRHOST_CLIENT=mock`（既定）で起動すると、決定論的なダミーデータを返す。実際の Airhost スクレイピング/API 連携は `src/airhost_mcp/airhost/http_client.py` の `HTTPAirhostClient` に後から実装する。
+> **現状はモック**。`AIRHOST_CLIENT=mock`（既定）で起動すると、決定論的なダミーデータを返す。Airhost は重い JS の管理コンソールなので、実環境連携は **Playwright（Chromium）でのブラウザ自動化**で行う。スケルトンは `src/airhost_mcp/airhost/browser_client.py` の `BrowserAirhostClient` にあり、ログイン＋MFAフローまで枠組みが入っている。
 
 ---
 
@@ -30,9 +30,9 @@ FastAPI ──► /healthz
                 │
                 └─► AirhostClient
                         ├─ MockAirhostClient        (default, deterministic)
-                        └─ HTTPAirhostClient        (TODO)
+                        └─ BrowserAirhostClient     (Playwright + Chromium, TBD)
                               │
-                              ├─ SessionStore       (local | GCS)
+                              ├─ SessionStore       (local | GCS) — stores Playwright storage_state
                               └─ MFAStrategy        (gmail | pubsub | manual)
 ```
 
@@ -47,6 +47,7 @@ FastAPI ──► /healthz
 ## 必要なもの
 
 - Python 3.11+
+- **Playwright + Chromium**（`AIRHOST_CLIENT=browser` を使う場合。`pip install` 後に `playwright install chromium` が必要）
 - `gcloud` CLI（Cloud Run デプロイ時）
 - Gmail API の OAuth client（`MFA_STRATEGY=gmail` を使う場合）
 - GCS バケット（Cloud Run 上でセッション永続化する場合）
@@ -61,6 +62,11 @@ FastAPI ──► /healthz
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+
+# Chromium 本体をローカルにインストール（モック起動だけなら不要）
+playwright install chromium
+# Linux でブラウザ依存ライブラリも入れる場合:
+# playwright install --with-deps chromium
 ```
 
 ### 2. `.env` を作成
@@ -207,12 +213,12 @@ curl -i -H "Authorization: Bearer YOUR_TOKEN" "$URL/mcp/"
 
 ## セッション永続化
 
-Cloud Run はインスタンスが頻繁に落ちる前提なので、Airhost のログインセッション（Cookie）を `SessionStore` に書き出して使い回す:
+Cloud Run はインスタンスが頻繁に落ちる前提なので、Airhost のログインセッションを `SessionStore` に書き出して使い回す。Playwright クライアントは `BrowserContext.storage_state()` の戻り値（cookies + 各 origin の localStorage）を JSON 化して保存する。
 
 - `SESSION_STORE=local`（既定） — `./.sessions/<user>.json`
 - `SESSION_STORE=gcs` — `gs://$SESSION_GCS_BUCKET/$SESSION_GCS_PREFIX<user>.json`
 
-`SESSION_TTL_SECONDS` を超えたセッションは自動で再ログインされる（実装は `HTTPAirhostClient` の TODO）。
+`SESSION_TTL_SECONDS` を超えたセッションは自動で再ログイン（パスワード + メール MFA）に流れる。
 
 ---
 
@@ -225,7 +231,7 @@ mcp-server-airhost/
 │   ├── tools.py             # 6 つの MCP ツール定義
 │   ├── auth.py              # Bearer 検証
 │   ├── config.py            # pydantic-settings
-│   ├── airhost/             # AirhostClient + Mock + HTTP(TODO)
+│   ├── airhost/             # AirhostClient + Mock + Browser(Playwright, TBD)
 │   ├── mfa/                 # MFAStrategy (gmail / pubsub / manual)
 │   └── session/             # SessionStore (local / gcs)
 ├── scripts/deploy_cloudrun.sh
@@ -240,5 +246,7 @@ mcp-server-airhost/
 ## 実装するときの注意
 
 1. `.env` と `gmail_credentials.json` / `gmail_token.json` は **絶対に commit しない**（`.gitignore` 済み）。
-2. `HTTPAirhostClient` が動くまで本番 `AIRHOST_CLIENT=http` には切り替えない。モックのまま Claude に接続して動作確認するのが先。
+2. `BrowserAirhostClient` が動くまで本番 `AIRHOST_CLIENT=browser` には切り替えない。モックのまま Claude に接続して動作確認するのが先。
 3. ベアラトークンは長く（32 バイト hex 推奨）、利用者ごとに別の値を発行する（誰のアクセスかログで識別したい場合に効く）。
+4. Cloud Run + Playwright は **メモリ ≥ 1Gi、min-instances=1** にしないとコールドスタートで Chromium 起動に数秒かかる。常時呼ぶならコスト面で min-instances=1 が現実的。
+5. `Dockerfile` の `mcr.microsoft.com/playwright/python:vX.Y.Z-jammy` のタグは `pyproject.toml` の `playwright>=` バージョンと合わせる（バージョンずれは起動時に警告 → 失敗の元）。

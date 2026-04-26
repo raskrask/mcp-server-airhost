@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     airhost_login_url: str = "https://app.airhost.co/login"
     airhost_username: str = ""
     airhost_password: str = ""
-    airhost_client: Literal["mock", "http"] = "mock"
+    airhost_client: Literal["mock", "browser"] = "mock"
+    browser_headless: bool = True
 
     # MFA
     mfa_strategy: Literal["gmail", "pubsub", "manual"] = "gmail"

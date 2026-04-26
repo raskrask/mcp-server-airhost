@@ -12,11 +12,13 @@ from typing import Any
 class SessionRecord:
     """Persisted Airhost session.
 
-    ``cookies`` is the raw cookie jar (as a dict). ``meta`` is for arbitrary
-    extras like CSRF tokens or the username the session belongs to.
+    ``state`` holds whatever the client implementation needs to reuse a login.
+    For the Playwright client this is the ``storage_state`` dict (cookies +
+    localStorage origins) returned by ``BrowserContext.storage_state()``.
+    ``meta`` is for arbitrary extras (last login timestamp, username, etc.).
     """
 
-    cookies: dict[str, str]
+    state: dict[str, Any]
     created_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
     meta: dict[str, Any] = field(default_factory=dict)
@@ -31,8 +33,12 @@ class SessionRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionRecord":
+        # Backward-compat: older records stored cookies under "cookies".
+        state = data.get("state")
+        if state is None and "cookies" in data:
+            state = {"cookies": data["cookies"], "origins": []}
         return cls(
-            cookies=data.get("cookies", {}),
+            state=state or {},
             created_at=data.get("created_at", time.time()),
             expires_at=data.get("expires_at", 0.0),
             meta=data.get("meta", {}),
