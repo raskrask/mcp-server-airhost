@@ -36,9 +36,14 @@ def create_app() -> FastAPI:
     )
 
     from mcp.server.fastmcp import FastMCP
+    from mcp.server.transport_security import TransportSecuritySettings
 
     # streamable_http_path="/" so the mount point itself serves MCP. Without
     # this, FastMCP appends its own "/mcp" and we end up at "/mcp/mcp".
+    #
+    # DNS rebinding protection is off: it only allows localhost by default,
+    # which would block Cloud Run / any reverse proxy. Bearer auth (above)
+    # already gates every request, so disabling the host check is safe here.
     mcp = FastMCP(
         name="airhost-mcp",
         instructions=(
@@ -47,6 +52,7 @@ def create_app() -> FastAPI:
             "is selected. The server is single-tenant — credentials are server-side."
         ),
         streamable_http_path="/",
+        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
     client = build_airhost_client(settings)
