@@ -1,6 +1,6 @@
 # Microsoft's official Playwright image: Python 3.11 + Chromium + system deps
 # preinstalled. Pin the tag to match the playwright version in pyproject.toml.
-FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.58.0-noble
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
