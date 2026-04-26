@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI
 
 from .airhost import build_airhost_client
 from .auth import verify_bearer
@@ -34,44 +35,42 @@ def create_app() -> FastAPI:
         format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
     )
 
-    # FastMCP — Streamable HTTP transport. Mounted under our chosen path.
     from mcp.server.fastmcp import FastMCP
 
+    # streamable_http_path="/" so the mount point itself serves MCP. Without
+    # this, FastMCP appends its own "/mcp" and we end up at "/mcp/mcp".
     mcp = FastMCP(
         name="airhost-mcp",
         instructions=(
             "Tools for managing Airhost listings, availability, and reservations. "
-            "All write operations affect live Airhost state when the HTTP client is "
-            "selected. The server is single-tenant — credentials are server-side."
+            "All write operations affect live Airhost state when the browser client "
+            "is selected. The server is single-tenant — credentials are server-side."
         ),
+        streamable_http_path="/",
     )
 
     client = build_airhost_client(settings)
     register_tools(mcp, client)
 
-    app = FastAPI(title="airhost-mcp", version="0.1.0")
+    # FastMCP's session manager owns a task group that must run inside an
+    # async context. Hook it into FastAPI's lifespan.
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with mcp.session_manager.run():
+            yield
+
+    app = FastAPI(title="airhost-mcp", version="0.1.0", lifespan=lifespan)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    # Mount the MCP Streamable HTTP app under the configured path.
-    # `streamable_http_app()` returns a Starlette app exposing the MCP protocol.
-    mcp_app = mcp.streamable_http_app()
-    app.mount(
-        settings.mcp_mount_path,
-        mcp_app,
-    )
-
-    # Apply Bearer auth to every request to the MCP mount path. We do this with
-    # a dependency-bearing route guard so the dependency runs *before* the
-    # mounted sub-app handles the request.
+    # Apply Bearer auth to every request to the MCP mount path.
     @app.middleware("http")
     async def bearer_gate(request, call_next):
         path = request.url.path
         mount = settings.mcp_mount_path.rstrip("/")
         if path == mount or path.startswith(mount + "/"):
-            # Re-use the FastAPI dependency machinery for consistent errors.
             try:
                 verify_bearer(request)
             except Exception as exc:  # HTTPException
@@ -85,8 +84,7 @@ def create_app() -> FastAPI:
                 )
         return await call_next(request)
 
-    # Reference the dependency to keep the import alive for tooling/IDEs.
-    _ = Depends(verify_bearer)
+    app.mount(settings.mcp_mount_path, mcp.streamable_http_app())
 
     return app
 

@@ -56,3 +56,10 @@ async def test_update_reservation_round_trip(client: MockAirhostClient) -> None:
         rid, ReservationUpdate(guest_name="Patched Name")
     )
     assert updated.guest_name == "Patched Name"
+
+
+async def test_update_unobserved_id_raises(client: MockAirhostClient) -> None:
+    with pytest.raises(ValueError):
+        await client.update_reservation(
+            "res_never_seen", ReservationUpdate(guest_name="x")
+        )

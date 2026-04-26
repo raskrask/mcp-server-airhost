@@ -56,10 +56,19 @@ def _seed(listing_id: str, target_date: date) -> int:
 class MockAirhostClient(AirhostClient):
     def __init__(self) -> None:
         # Mutable layer over the fixed seed so block/update calls "stick"
-        # for the lifetime of the process.
+        # for the lifetime of the process. ``_observed`` mirrors how the real
+        # client sees reservations: an id is updatable only after it has been
+        # surfaced by a fetch call (list/get).
         self._blocks: dict[tuple[str, date], BlockResult] = {}
-        self._reservation_overrides: dict[str, Reservation] = {}
+        self._observed: dict[str, Reservation] = {}
         self._lock = asyncio.Lock()
+
+    def _observe(self, reservation: Reservation) -> Reservation:
+        existing = self._observed.get(reservation.reservation_id)
+        if existing is not None:
+            return existing
+        self._observed[reservation.reservation_id] = reservation
+        return reservation
 
     async def list_listings(self) -> list[Listing]:
         return list(_FIXED_LISTINGS)
@@ -115,7 +124,7 @@ class MockAirhostClient(AirhostClient):
         res = self._seeded_reservation(listing_id, target_date)
         if res is None:
             return []
-        return [self._reservation_overrides.get(res.reservation_id, res)]
+        return [self._observe(res)]
 
     async def block_date(
         self, listing_id: str, target_date: date, reason: str | None = None
@@ -131,23 +140,18 @@ class MockAirhostClient(AirhostClient):
         self, reservation_id: str, patch: ReservationUpdate
     ) -> Reservation:
         async with self._lock:
-            existing = self._reservation_overrides.get(reservation_id)
+            existing = self._observed.get(reservation_id)
             if existing is None:
-                # Re-seed from the synthetic reservation id format.
-                try:
-                    _, listing_id, iso = reservation_id.split("_", 2)
-                    existing = self._seeded_reservation(listing_id, date.fromisoformat(iso))
-                except (ValueError, AttributeError):
-                    existing = None
-            if existing is None:
-                raise ValueError(f"unknown reservation_id: {reservation_id}")
-
+                raise ValueError(
+                    f"unknown reservation_id: {reservation_id} "
+                    "(fetch it via list/get first to make it visible to the mock)"
+                )
             updated = existing.model_copy(update=patch.as_patch())
             if patch.check_in or patch.check_out:
                 updated = updated.model_copy(
                     update={"nights": (updated.check_out - updated.check_in).days}
                 )
-            self._reservation_overrides[reservation_id] = updated
+            self._observed[reservation_id] = updated
             return updated
 
     async def list_reservations_in_range(
@@ -172,6 +176,6 @@ class MockAirhostClient(AirhostClient):
                 res = self._seeded_reservation(lid, cur)
                 if res is None:
                     continue
-                out.append(self._reservation_overrides.get(res.reservation_id, res))
+                out.append(self._observe(res))
             cur += timedelta(days=1)
         return out
