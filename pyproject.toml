@@ -1,7 +1,7 @@
 [project]
 name = "airhost-mcp"
 version = "0.1.0"
-description = "MCP server for Airhost. Designed to run on Cloud Run with Bearer auth."
+description = "MCP server for Airhost. Designed to run on Cloud Run with OAuth 2.1 / Firebase auth."
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.2.0",
@@ -16,6 +16,7 @@ dependencies = [
     "google-auth-oauthlib>=1.2.0",
     "google-api-python-client>=2.120.0",
     "google-cloud-storage>=2.16.0",
+    "firebase-admin>=6.5.0",
     "beautifulsoup4>=4.12.3",
     "tenacity>=8.2.3",
     "playwright==1.58.0",
