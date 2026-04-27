@@ -25,7 +25,7 @@ Airhost 操作用の MCP サーバ。Claude（リモート MCP）から呼び出
 Claude (remote MCP client)
         │  HTTPS + Bearer
         ▼
-FastAPI ──► /healthz
+FastAPI ──► /health
         └─► /mcp  (Streamable HTTP, MCP protocol)
                 │
                 └─► AirhostClient
@@ -95,8 +95,9 @@ uvicorn airhost_mcp.server:app --host 0.0.0.0 --port 8080 --reload
 ### 4. 動作確認
 
 ```bash
-curl -s http://localhost:8080/healthz
+curl -s http://localhost:8080/health
 # {"status":"ok"}
+# (path is /health, not /healthz — Cloud Run reserves /healthz at the frontend layer)
 
 # 認証なしは 401
 curl -i http://localhost:8080/mcp/
@@ -193,7 +194,7 @@ gcloud run services update airhost-mcp \
 
 ```bash
 URL=$(gcloud run services describe airhost-mcp --region asia-northeast1 --format='value(status.url)')
-curl -s "$URL/healthz"
+curl -s "$URL/health"
 curl -i -H "Authorization: Bearer YOUR_TOKEN" "$URL/mcp/"
 ```
 

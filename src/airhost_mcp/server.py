@@ -67,8 +67,10 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="airhost-mcp", version="0.1.0", lifespan=lifespan)
 
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    # Cloud Run reserves the literal path "/healthz" at the Frontend layer
+    # (it 404s before reaching the container). Use "/health" instead.
+    @app.get("/health")
+    async def health() -> dict[str, str]:
         return {"status": "ok"}
 
     # Apply Bearer auth to every request to the MCP mount path.
