@@ -120,34 +120,68 @@ class BrowserAirhostClient(AirhostClient):
         await self._session_store.save(self._username, record)
 
     async def _login(self, page: Page, context: BrowserContext) -> None:
-        """Run the password + email-MFA login flow.
+        """Run the password + email-MFA login flow against Airhost PMS.
 
-        Selectors are placeholders — replace once the real Airhost login page
-        structure is known.
+        Airhost's sign-in page (https://pms.airhost.co/ja/sign_in) renders
+        the OTP input alongside the email/password fields from first paint;
+        the OTP field is just disabled until you submit credentials. So the
+        flow is:
+
+          1. Fill ``[data-testid=email]`` and ``[data-testid=password]``.
+          2. Capture ``since`` BEFORE clicking submit, so the Gmail poller
+             only matches MFA mails sent after this attempt.
+          3. Click ``[data-testid=login]``.
+          4. Wait for the OTP input to become enabled (it stays in the DOM
+             but ``disabled`` toggles between modes).
+          5. Fetch the code via the configured MFA strategy.
+          6. Fill ``[data-testid=otpCode]``, click submit again.
+          7. Wait for navigation away from the sign-in page.
         """
         async with self._login_lock:
+            await page.goto(self._login_url, wait_until="domcontentloaded")
+            await page.fill('[data-testid="email"]', self._username)
+            await page.fill('[data-testid="password"]', self._password)
+
             since = time.time()
-            await page.goto(self._login_url)
-            # TODO: replace selectors once Airhost login DOM is inspected.
-            await page.fill("input[name='email']", self._username)
-            await page.fill("input[name='password']", self._password)
-            await page.click("button[type='submit']")
+            await page.click('[data-testid="login"]')
 
-            # Detect MFA prompt. Adjust selector + URL pattern to actual UI.
-            await page.wait_for_load_state("networkidle")
-            mfa_input = page.locator("input[name='mfa_code'], input[name='code']").first
-            if await mfa_input.count() > 0:
-                try:
-                    code = await self._mfa.fetch_code(
-                        since_epoch=since, timeout_seconds=self._mfa_timeout
-                    )
-                except MFATimeoutError:
-                    raise
-                await mfa_input.fill(code)
-                await page.click("button[type='submit']")
-                await page.wait_for_load_state("networkidle")
+            # OTP input is always present in the DOM; we wait for the
+            # *enabled* state to avoid filling it before the credentials
+            # round-trip completes.
+            otp = page.locator('[data-testid="otpCode"]')
+            await otp.wait_for(state="visible", timeout=15000)
+            # ant-design disables the field via the `disabled` attribute.
+            await page.wait_for_function(
+                "() => { const el = document.querySelector('[data-testid=\"otpCode\"]'); "
+                "return el && !el.disabled; }",
+                timeout=15000,
+            )
 
-            # TODO: assert we landed on the dashboard, raise on auth failure.
+            try:
+                code = await self._mfa.fetch_code(
+                    since_epoch=since, timeout_seconds=self._mfa_timeout
+                )
+            except MFATimeoutError:
+                logger.error("MFA code did not arrive within %ss", self._mfa_timeout)
+                raise
+
+            await otp.fill(code)
+            await page.click('[data-testid="login"]')
+
+            # Successful login navigates away from /sign_in. Failures stay
+            # on the same URL and surface an ant-design error toast.
+            try:
+                await page.wait_for_url(
+                    lambda url: "/sign_in" not in url, timeout=20000
+                )
+            except Exception as exc:
+                # Look for an error message on the page to give a useful log.
+                err = page.locator(".ant-message-error, .ant-form-item-explain-error").first
+                detail = await err.text_content() if await err.count() > 0 else None
+                raise RuntimeError(
+                    f"Airhost login did not navigate away from sign_in (msg={detail!r})"
+                ) from exc
+
             logger.info("airhost login completed for %s", self._username)
 
     # ----- tool methods (TBD against real UI) -----

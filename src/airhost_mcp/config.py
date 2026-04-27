@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     mcp_mount_path: str = "/mcp"
 
     # Airhost
-    airhost_login_url: str = "https://app.airhost.co/login"
+    airhost_login_url: str = "https://pms.airhost.co/ja/sign_in"
     airhost_username: str = ""
     airhost_password: str = ""
     airhost_client: Literal["mock", "browser"] = "mock"
@@ -31,8 +31,9 @@ class Settings(BaseSettings):
 
     # MFA
     mfa_strategy: Literal["gmail", "pubsub", "manual"] = "gmail"
-    mfa_sender: str = ""
-    mfa_subject_regex: str = r"^.*verification.*code.*$"
+    # Airhost MFA mail: from=noreply@airhost.co, subject="[Airhost One] ログインコードは 123456 です。"
+    mfa_sender: str = "noreply@airhost.co"
+    mfa_subject_regex: str = r"ログインコードは\s+(\d{6})"
     mfa_code_regex: str = r"\b(\d{6})\b"
     mfa_timeout_seconds: int = 120
 
