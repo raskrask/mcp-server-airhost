@@ -31,9 +31,17 @@ class Settings(BaseSettings):
 
     # MFA
     mfa_strategy: Literal["gmail", "pubsub", "manual"] = "gmail"
-    # Airhost MFA mail: from=noreply@airhost.co, subject="[Airhost One] ログインコードは 123456 です。"
+    # Airhost MFA mail comes in two flavors:
+    #   * Normal:    Subject "[Airhost One] ログインコードは 123456 です。"
+    #                — code is in the subject; we capture it.
+    #   * New device: Subject "新しいデバイスのログイン確認"
+    #                — code is in the body ("OTP認証コード: 615436");
+    #                  subject regex matches but doesn't capture, so we fall
+    #                  through to mfa_code_regex against the body.
     mfa_sender: str = "noreply@airhost.co"
-    mfa_subject_regex: str = r"ログインコードは\s+(\d{6})"
+    mfa_subject_regex: str = (
+        r"(?:ログインコードは\s+(\d{6})|新しいデバイス|認証コード|OTP)"
+    )
     mfa_code_regex: str = r"\b(\d{6})\b"
     mfa_timeout_seconds: int = 120
 
