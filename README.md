@@ -200,6 +200,81 @@ curl -i -H "Authorization: Bearer YOUR_TOKEN" "$URL/mcp/"
 
 ---
 
+## ユーザーの追加 / 失効 / ローテーション
+
+利用者は `MCP_BEARER_TOKENS`（カンマ区切りの複数トークン）として Secret Manager に保存される。**サーバ側では「どのトークンが誰のものか」を持っていない** ので、配布時に各人と「name : token」の対応をパスワードマネージャ等で別途管理する。
+
+トークンを「発行できる」のは、GCP プロジェクトの Secret Manager に書き込み権限を持つ人（owner / editor / `roles/secretmanager.admin`）だけ。サーバ側は Secret Manager に登録されたトークンしか信頼しないので、第三者が手元で `openssl rand` してトークンを作っても 401 になる。
+
+### 新しい人を追加する
+
+既存トークンに新規トークンを **追加** する形で新バージョンを作る。
+
+```bash
+source /tmp/gcrun-env.sh   # gcloud のための PATH/Python 設定（環境ごと）
+
+NEW=$(openssl rand -hex 32)
+echo "New token (give to user, do NOT log this anywhere): $NEW"
+
+EXISTING=$(gcloud secrets versions access latest --secret=MCP_BEARER_TOKENS)
+printf "%s,%s" "$EXISTING" "$NEW" \
+  | gcloud secrets versions add MCP_BEARER_TOKENS --data-file=-
+
+# Cloud Run は env を起動時に解決するので、新リビジョンの作成が必要。
+gcloud run services update airhost-mcp \
+  --region asia-northeast1 \
+  --update-secrets "MCP_BEARER_TOKENS=MCP_BEARER_TOKENS:latest"
+```
+
+新トークンは `unset NEW` してメモリから消す。コマンドラインに残った `echo` 行は `history -d <番号>` で削除しておく。
+
+### 既存ユーザーのトークンを失効させる（漏洩時など）
+
+対象のトークンを抜いた新バージョンを作る。
+
+```bash
+source /tmp/gcrun-env.sh
+TOKEN_TO_REVOKE="抜きたいトークンの値"
+
+KEEP=$(gcloud secrets versions access latest --secret=MCP_BEARER_TOKENS \
+  | tr ',' '\n' | grep -v "^${TOKEN_TO_REVOKE}$" | paste -sd, -)
+printf "%s" "$KEEP" | gcloud secrets versions add MCP_BEARER_TOKENS --data-file=-
+
+gcloud run services update airhost-mcp \
+  --region asia-northeast1 \
+  --update-secrets "MCP_BEARER_TOKENS=MCP_BEARER_TOKENS:latest"
+
+# (任意) 完全に履歴も消すなら、古いバージョンを destroy する。
+# gcloud secrets versions list MCP_BEARER_TOKENS
+# gcloud secrets versions destroy <NUMBER> --secret=MCP_BEARER_TOKENS
+```
+
+新リビジョンが routing されたら、失効済みトークンでのリクエストは即 401 になる。
+
+### 全員一括ローテーション（定期、または incident 対応）
+
+```bash
+source /tmp/gcrun-env.sh
+T1=$(openssl rand -hex 32); T2=$(openssl rand -hex 32)
+echo "User A: $T1"
+echo "User B: $T2"
+
+printf "%s,%s" "$T1" "$T2" \
+  | gcloud secrets versions add MCP_BEARER_TOKENS --data-file=-
+
+gcloud run services update airhost-mcp \
+  --region asia-northeast1 \
+  --update-secrets "MCP_BEARER_TOKENS=MCP_BEARER_TOKENS:latest"
+```
+
+### 注意
+
+- このプロジェクトの認証は **Bearer = アクセス権そのもの**（共有秘密方式）。トークンを知っている人なら誰でも通る。
+- 厳密な「本人認証」が必要になったら、OAuth 2.1 (Google ログイン + ホワイトリスト) に切り替える方針。実装は `BrowserAirhostClient` の本実装が落ち着いてから検討。
+- 「誰がいつどのツールを呼んだか」の監査ログは現状未実装。`auth.py:verify_bearer` がマッチしたトークン文字列を返すので、ミドルウェアでハッシュ化して仕込むだけで足りる（小工事）。
+
+---
+
 ## MFA 戦略の使い分け
 
 | 戦略     | env                         | 用途                                                                                      |
