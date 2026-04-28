@@ -39,9 +39,34 @@ from .base import (
     Listing,
     Reservation,
     ReservationUpdate,
+    RoomType,
+    RoomUnit,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_int(value: Any) -> int | None:
+    """Coerce values that Airhost sometimes returns as strings or floats.
+
+    Examples seen in the wild: ``"1"`` (str), ``1.0`` (float), ``""`` (empty
+    string), ``None``. We accept those and only return ints we can trust.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class BrowserAirhostClient(AirhostClient):
@@ -191,42 +216,112 @@ class BrowserAirhostClient(AirhostClient):
     _API_BASE = "https://api2.airhost.co/api/one"
 
     async def list_listings(self) -> list[Listing]:
-        """Fetch every house this account manages.
+        """Fetch every house with its room types nested.
 
-        Calls ``GET /api/one/pms/houses`` directly via the Playwright request
-        context (so the session cookie set during login is reused). The page
-        size is intentionally large — Airhost paginates this endpoint, but
-        2-user setups won't realistically have thousands of properties.
+        Two-step fetch (Airhost has no combined endpoint):
+
+        1. ``GET /pms/houses`` — buildings the account manages.
+        2. For each house, ``GET /pms/room_types?house_id=...`` — room types
+           and their room units.
+
+        Concurrent fetches per-house keep total latency down on accounts
+        with many properties. Errors on a single house's room_types fetch
+        are logged but don't abort the whole listing — the house is
+        returned with an empty ``room_types`` list and the operator can
+        retry.
         """
         async with self._page() as page:
-            url = (
+            houses_url = (
                 f"{self._API_BASE}/pms/houses"
                 "?locale=ja&sorts=created_at%3Adesc"
                 "&page_num=1&page_size=200"
                 "&field_sets_house=tag_list"
             )
-            resp = await page.request.get(url)
-            if not resp.ok:
-                body = await resp.text()
+            h_resp = await page.request.get(houses_url)
+            if not h_resp.ok:
                 raise RuntimeError(
-                    f"Airhost houses API returned HTTP {resp.status}: {body[:300]}"
+                    f"Airhost houses API returned HTTP {h_resp.status}: "
+                    f"{(await h_resp.text())[:300]}"
                 )
-            payload = await resp.json()
-            if not payload.get("success"):
-                raise RuntimeError(f"Airhost houses API failed: {payload}")
+            h_payload = await h_resp.json()
+            if not h_payload.get("success"):
+                raise RuntimeError(f"Airhost houses API failed: {h_payload}")
 
-            return [
-                Listing(
-                    listing_id=item["id"],
-                    name=item.get("internal_name") or item.get("name", ""),
-                    address=item.get("address"),
-                    bedrooms=None,
-                    max_guests=None,
-                    nightly_rate_jpy=None,
-                    timezone="Asia/Tokyo",
+            houses = h_payload.get("data", []) or []
+            if not houses:
+                return []
+
+            # Fetch room_types for each house in parallel.
+            room_types_per_house = await asyncio.gather(
+                *[self._fetch_room_types(page, h["id"]) for h in houses],
+                return_exceptions=True,
+            )
+
+            listings: list[Listing] = []
+            for house, rts_or_exc in zip(houses, room_types_per_house, strict=True):
+                if isinstance(rts_or_exc, BaseException):
+                    logger.warning(
+                        "room_types fetch failed for house %s: %s",
+                        house.get("id"),
+                        rts_or_exc,
+                    )
+                    room_types: list[RoomType] = []
+                else:
+                    room_types = rts_or_exc
+
+                listings.append(
+                    Listing(
+                        listing_id=house["id"],
+                        name=house.get("internal_name") or house.get("name", ""),
+                        address=house.get("address"),
+                        property_type=house.get("property_type"),
+                        timezone="Asia/Tokyo",
+                        checkin_at=house.get("checkin_at"),
+                        checkout_at=house.get("checkout_at"),
+                        room_types=room_types,
+                    )
                 )
-                for item in payload.get("data", [])
-            ]
+            return listings
+
+    async def _fetch_room_types(self, page: Page, house_id: str) -> list[RoomType]:
+        """Helper: fetch room types (with units) for one house."""
+        url = (
+            f"{self._API_BASE}/pms/room_types"
+            f"?locale=ja&house_id={house_id}"
+            "&field_sets_room_type=basic%2Crich"
+            "&page_size=200&page_num=1"
+        )
+        resp = await page.request.get(url)
+        if not resp.ok:
+            raise RuntimeError(
+                f"room_types API HTTP {resp.status}: {(await resp.text())[:300]}"
+            )
+        payload = await resp.json()
+        if not payload.get("success"):
+            raise RuntimeError(f"room_types API failed: {payload}")
+
+        out: list[RoomType] = []
+        for item in payload.get("data", []) or []:
+            settings = item.get("room_settings") or {}
+            out.append(
+                RoomType(
+                    room_type_id=item["id"],
+                    name=item.get("name", ""),
+                    occupancy=settings.get("occupancy"),
+                    bedrooms=_safe_int(settings.get("bedrooms")),
+                    bathrooms=_safe_float(settings.get("bathrooms")),
+                    nightly_rate_jpy=_safe_int(item.get("min_price")),
+                    cleaning_fee_jpy=_safe_int(settings.get("cleaning_fee_to_guest")),
+                    room_units=[
+                        RoomUnit(
+                            room_unit_id=u["id"],
+                            room_no=u.get("display_room_no") or u.get("room_no", ""),
+                        )
+                        for u in (item.get("room_units") or [])
+                    ],
+                )
+            )
+        return out
 
     async def get_availability(self, listing_id: str, target_date: date) -> Availability:
         async with self._page() as page:  # noqa: F841

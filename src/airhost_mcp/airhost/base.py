@@ -15,14 +15,37 @@ from pydantic import BaseModel, Field
 ReservationStatus = Literal["confirmed", "cancelled", "blocked", "pending"]
 
 
+# Airhost's data hierarchy is House > RoomType > RoomUnit. We surface the full
+# tree to the MCP client so it can reason about cross-room moves within the
+# same building (e.g. fitting a 1/1-1/3 stay across rooms 101 and 102 when
+# neither has the full window free on its own).
+class RoomUnit(BaseModel):
+    room_unit_id: str
+    room_no: str  # display label, e.g. "101"
+
+
+class RoomType(BaseModel):
+    room_type_id: str
+    name: str
+    occupancy: int | None = None  # max_guests for this room type
+    bedrooms: int | None = None
+    bathrooms: float | None = None
+    nightly_rate_jpy: int | None = None  # min_price
+    cleaning_fee_jpy: int | None = None
+    room_units: list[RoomUnit] = Field(default_factory=list)
+
+
 class Listing(BaseModel):
-    listing_id: str
+    """A House (building). Aggregates one or more RoomTypes."""
+
+    listing_id: str  # = house_id
     name: str
     address: str | None = None
-    bedrooms: int | None = None
-    max_guests: int | None = None
-    nightly_rate_jpy: int | None = None
+    property_type: str | None = None  # e.g. "apartment", "hotel"
     timezone: str = "Asia/Tokyo"
+    checkin_at: str | None = None
+    checkout_at: str | None = None
+    room_types: list[RoomType] = Field(default_factory=list)
 
 
 class Availability(BaseModel):

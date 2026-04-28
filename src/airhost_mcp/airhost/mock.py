@@ -18,34 +18,89 @@ from .base import (
     Listing,
     Reservation,
     ReservationUpdate,
+    RoomType,
+    RoomUnit,
 )
 
+# Deterministic mock data covering the House > RoomType > RoomUnit hierarchy.
+# Single-room properties have one RoomType; multi-room ones (lst_002) have
+# multiple so cross-room booking moves can be exercised.
 _FIXED_LISTINGS: list[Listing] = [
     Listing(
         listing_id="lst_001",
         name="Shibuya Sky Loft",
         address="Shibuya, Tokyo",
-        bedrooms=1,
-        max_guests=3,
-        nightly_rate_jpy=18000,
+        property_type="apartment",
+        room_types=[
+            RoomType(
+                room_type_id="lst_001_rt_a",
+                name="Studio",
+                occupancy=3,
+                bedrooms=1,
+                bathrooms=1.0,
+                nightly_rate_jpy=18000,
+                cleaning_fee_jpy=5000,
+                room_units=[RoomUnit(room_unit_id="lst_001_rt_a_u1", room_no="A")],
+            ),
+        ],
     ),
     Listing(
         listing_id="lst_002",
         name="Asakusa Riverside Annex",
         address="Asakusa, Tokyo",
-        bedrooms=2,
-        max_guests=5,
-        nightly_rate_jpy=22500,
+        property_type="apartment",
+        room_types=[
+            RoomType(
+                room_type_id="lst_002_rt_101",
+                name="101",
+                occupancy=3,
+                bedrooms=1,
+                bathrooms=1.0,
+                nightly_rate_jpy=20000,
+                cleaning_fee_jpy=6000,
+                room_units=[RoomUnit(room_unit_id="lst_002_rt_101_u1", room_no="101")],
+            ),
+            RoomType(
+                room_type_id="lst_002_rt_201",
+                name="201",
+                occupancy=5,
+                bedrooms=2,
+                bathrooms=1.0,
+                nightly_rate_jpy=22500,
+                cleaning_fee_jpy=7000,
+                room_units=[RoomUnit(room_unit_id="lst_002_rt_201_u1", room_no="201")],
+            ),
+        ],
     ),
     Listing(
         listing_id="lst_003",
         name="Kyoto Machiya Stay",
         address="Higashiyama, Kyoto",
-        bedrooms=2,
-        max_guests=4,
-        nightly_rate_jpy=26000,
+        property_type="apartment",
+        room_types=[
+            RoomType(
+                room_type_id="lst_003_rt_a",
+                name="Whole House",
+                occupancy=4,
+                bedrooms=2,
+                bathrooms=1.0,
+                nightly_rate_jpy=26000,
+                cleaning_fee_jpy=8000,
+                room_units=[RoomUnit(room_unit_id="lst_003_rt_a_u1", room_no="A")],
+            ),
+        ],
     ),
 ]
+
+
+def _primary_rate(listing: Listing) -> int | None:
+    """Mock helper: pick a representative nightly rate for the building.
+
+    Real Airhost data has rates per-RoomType; for the simple Availability
+    model we surface the cheapest room type as a placeholder.
+    """
+    rates = [rt.nightly_rate_jpy for rt in listing.room_types if rt.nightly_rate_jpy]
+    return min(rates) if rates else None
 
 
 def _seed(listing_id: str, target_date: date) -> int:
@@ -90,7 +145,7 @@ class MockAirhostClient(AirhostClient):
             listing_id=listing_id,
             target_date=target_date,
             available=(seed % 10) >= 3,
-            nightly_rate_jpy=listing.nightly_rate_jpy,
+            nightly_rate_jpy=_primary_rate(listing),
         )
 
     def _seeded_reservation(self, listing_id: str, target_date: date) -> Reservation | None:
@@ -101,7 +156,7 @@ class MockAirhostClient(AirhostClient):
         nights = 1 + (seed % 4)
         guests = 1 + (seed % 4)
         listing = next((l for l in _FIXED_LISTINGS if l.listing_id == listing_id), None)
-        nightly = listing.nightly_rate_jpy if listing else 20000
+        nightly = _primary_rate(listing) if listing else 20000
         rid = f"res_{listing_id}_{target_date.isoformat()}"
         return Reservation(
             reservation_id=rid,
