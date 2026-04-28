@@ -2,7 +2,7 @@
 
 Exposes a FastMCP server over Streamable HTTP, mounted under
 ``MCP_MOUNT_PATH`` of a FastAPI app. Every request to the mount path is
-gated by an OAuth 2.1 bearer token issued by Firebase Authentication.
+gated by an OAuth 2.1 bearer token issued by Auth0.
 
 Run locally::
 

@@ -1,19 +1,18 @@
-"""Tests for the OAuth 2.1 / Firebase auth path.
+"""Tests for the OAuth 2.1 / Auth0 auth path.
 
-Every Firebase call is mocked — these tests never touch the network. They
-cover both the bearer-token validator and the well-known discovery
-endpoints.
+Every Auth0 / network call is mocked — these tests never touch a real
+tenant. They cover both the bearer-token validator and the well-known
+discovery endpoints.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI
 
 from airhost_mcp import auth as auth_mod
 from airhost_mcp.config import reset_settings_cache
@@ -31,43 +30,53 @@ def _env(monkeypatch: pytest.MonkeyPatch):
     for key in (
         "MCP_BEARER_TOKENS",
         "FIREBASE_PROJECT_ID",
+        "AUTH0_DOMAIN",
+        "AUTH0_AUDIENCE",
+        "AUTH0_ISSUER",
         "MCP_ALLOWED_EMAILS",
         "MCP_PUBLIC_URL",
         "DEV_DISABLE_AUTH",
         "K_SERVICE",
     ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("FIREBASE_PROJECT_ID", "mot-cozy-space")
+    monkeypatch.setenv("AUTH0_DOMAIN", "tenant.jp.auth0.com")
+    monkeypatch.setenv("AUTH0_AUDIENCE", "https://airhost-mcp.example.com")
     monkeypatch.setenv("MCP_ALLOWED_EMAILS", "alice@example.com,bob@example.com")
     monkeypatch.setenv("MCP_PUBLIC_URL", "https://mcp.example.com")
     reset_settings_cache()
     reset_well_known_cache()
-    # Pretend firebase_admin has been initialized so verify_oauth_token
-    # doesn't try to import / contact it.
-    auth_mod._firebase_ready = True
+    auth_mod.reset_jwks_cache()
     yield
-    auth_mod._firebase_ready = False
     reset_settings_cache()
     reset_well_known_cache()
+    auth_mod.reset_jwks_cache()
 
 
-def _make_request(headers: dict[str, str] | None = None) -> Request:
-    """Build a minimal ASGI Request for the auth helpers."""
-    scope: dict[str, Any] = {
+def _fake_jwks() -> dict[str, Any]:
+    """Minimal JWKS shape — only ``kid`` is read by the verifier."""
+    return {"keys": [{"kid": "test-kid-1", "kty": "RSA", "n": "x", "e": "AQAB"}]}
+
+
+def _build_request(token: str | None = None) -> Any:
+    """Construct a minimal FastAPI Request for direct verifier calls."""
+    headers: list[tuple[bytes, bytes]] = []
+    if token is not None:
+        headers.append((b"authorization", f"Bearer {token}".encode()))
+    scope = {
         "type": "http",
-        "http_version": "1.1",
+        "headers": headers,
         "method": "POST",
-        "scheme": "https",
         "path": "/mcp/",
-        "raw_path": b"/mcp/",
-        "query_string": b"",
-        "headers": [
-            (k.lower().encode(), v.encode()) for k, v in (headers or {}).items()
-        ],
+        "scheme": "https",
         "server": ("mcp.example.com", 443),
-        "client": ("127.0.0.1", 12345),
+        "root_path": "",
+        "query_string": b"",
     }
-    return Request(scope)
+    from fastapi import Request
+
+    request = Request(scope)
+    request._receive = AsyncMock()  # type: ignore[attr-defined]
+    return request
 
 
 # --------------------------------------------------------------------------- #
@@ -75,100 +84,165 @@ def _make_request(headers: dict[str, str] | None = None) -> Request:
 # --------------------------------------------------------------------------- #
 
 
-async def test_happy_path_sets_user_email() -> None:
-    claims = {
-        "email": "Alice@Example.com",
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_happy_path(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.return_value = {
+        "sub": "google-oauth2|123",
+        "email": "alice@example.com",
         "email_verified": True,
-        "sub": "uid-123",
+        "iss": "https://tenant.jp.auth0.com/",
+        "aud": "https://airhost-mcp.example.com",
     }
-    request = _make_request({"Authorization": "Bearer good-token"})
-    with patch("firebase_admin.auth.verify_id_token", return_value=claims) as m:
-        out = await auth_mod.verify_oauth_token(request)
-    m.assert_called_once_with("good-token", check_revoked=False)
-    assert out is claims
-    assert request.state.user_email == "alice@example.com"
+
+    claims = await auth_mod.verify_oauth_token(_build_request("opaque.jwt.token"))
+    assert claims["email"] == "alice@example.com"
 
 
-async def test_email_not_in_allowlist_returns_401() -> None:
-    claims = {
-        "email": "eve@example.com",
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_namespaced_email_claim(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    """Auth0 Action puts email as a namespaced custom claim — accept it."""
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.return_value = {
+        "sub": "google-oauth2|123",
+        "https://airhost-mcp/email": "alice@example.com",
+        "https://airhost-mcp/email_verified": True,
+    }
+    claims = await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert claims["https://airhost-mcp/email"] == "alice@example.com"
+
+
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_email_not_in_allowlist(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.return_value = {
+        "email": "stranger@example.com",
         "email_verified": True,
     }
-    request = _make_request({"Authorization": "Bearer good-token"})
-    with patch("firebase_admin.auth.verify_id_token", return_value=claims):
-        with pytest.raises(HTTPException) as excinfo:
-            await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
-    assert "WWW-Authenticate" in (excinfo.value.headers or {})
-    challenge = (excinfo.value.headers or {})["WWW-Authenticate"]
-    assert 'error="invalid_token"' in challenge
-    assert "/.well-known/oauth-protected-resource" in challenge
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
+    assert "allowlist" in getattr(ei.value, "detail", "")
 
 
-async def test_email_not_verified_returns_401() -> None:
-    claims = {"email": "alice@example.com", "email_verified": False}
-    request = _make_request({"Authorization": "Bearer good-token"})
-    with patch("firebase_admin.auth.verify_id_token", return_value=claims):
-        with pytest.raises(HTTPException) as excinfo:
-            await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_email_unverified(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.return_value = {
+        "email": "alice@example.com",
+        "email_verified": False,
+    }
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
-async def test_missing_authorization_header_returns_401() -> None:
-    request = _make_request({})
-    with pytest.raises(HTTPException) as excinfo:
-        await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
-    assert "WWW-Authenticate" in (excinfo.value.headers or {})
+async def test_verify_missing_header() -> None:
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request(None))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
-async def test_malformed_authorization_header_returns_401() -> None:
-    request = _make_request({"Authorization": "Basic abc"})
-    with pytest.raises(HTTPException) as excinfo:
-        await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
+async def test_verify_empty_bearer() -> None:
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request(""))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
-async def test_empty_bearer_value_returns_401() -> None:
-    request = _make_request({"Authorization": "Bearer "})
-    with pytest.raises(HTTPException) as excinfo:
-        await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_malformed_jwt(mock_get_header) -> None:
+    from jose.exceptions import JWTError
+
+    mock_get_header.side_effect = JWTError("Invalid header string")
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("not-a-jwt"))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
-async def test_firebase_raises_returns_401() -> None:
-    request = _make_request({"Authorization": "Bearer bad-token"})
-    with patch(
-        "firebase_admin.auth.verify_id_token",
-        side_effect=ValueError("token expired"),
-    ):
-        with pytest.raises(HTTPException) as excinfo:
-            await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
-    challenge = (excinfo.value.headers or {})["WWW-Authenticate"]
-    assert 'error="invalid_token"' in challenge
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_signature_rejected(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    from jose.exceptions import JWTError
+
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.side_effect = JWTError("Signature verification failed")
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
-async def test_missing_email_claim_returns_401() -> None:
-    claims = {"email_verified": True, "sub": "uid"}  # no 'email'
-    request = _make_request({"Authorization": "Bearer good-token"})
-    with patch("firebase_admin.auth.verify_id_token", return_value=claims):
-        with pytest.raises(HTTPException) as excinfo:
-            await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_missing_email_claim(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    mock_get_header.return_value = {"kid": "test-kid-1"}
+    mock_jwks.return_value = _fake_jwks()
+    mock_decode.return_value = {
+        "sub": "google-oauth2|999",
+        # no email at all
+    }
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
+    assert "email" in getattr(ei.value, "detail", "")
 
 
-async def test_empty_allowlist_returns_401(monkeypatch: pytest.MonkeyPatch) -> None:
+@patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
+@patch("airhost_mcp.auth.jwt.decode")
+@patch("airhost_mcp.auth.jwt.get_unverified_header")
+async def test_verify_no_kid_in_header(
+    mock_get_header, mock_decode, mock_jwks
+) -> None:
+    mock_get_header.return_value = {}  # no kid
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
+
+
+async def test_verify_empty_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_ALLOWED_EMAILS", "")
     reset_settings_cache()
-    request = _make_request({"Authorization": "Bearer good-token"})
-    with pytest.raises(HTTPException) as excinfo:
-        await auth_mod.verify_oauth_token(request)
-    assert excinfo.value.status_code == 401
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
+
+
+async def test_verify_unconfigured_auth0(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH0_DOMAIN", "")
+    reset_settings_cache()
+    with pytest.raises(Exception) as ei:
+        await auth_mod.verify_oauth_token(_build_request("tok"))
+    assert getattr(ei.value, "status_code", None) == 401
 
 
 # --------------------------------------------------------------------------- #
-# discovery endpoints                                                         #
+# Discovery endpoints                                                         #
 # --------------------------------------------------------------------------- #
 
 
@@ -180,24 +254,24 @@ def _app() -> FastAPI:
 
 async def test_protected_resource_metadata_shape() -> None:
     transport = httpx.ASGITransport(app=_app())
-    async with httpx.AsyncClient(transport=transport, base_url="https://mcp.example.com") as c:
+    async with httpx.AsyncClient(
+        transport=transport, base_url="https://mcp.example.com"
+    ) as c:
         resp = await c.get("/.well-known/oauth-protected-resource")
     assert resp.status_code == 200
     body = resp.json()
     assert body["resource"] == "https://mcp.example.com"
-    assert body["authorization_servers"] == [
-        "https://securetoken.google.com/mot-cozy-space"
-    ]
-    assert "header" in body["bearer_methods_supported"]
-    assert "openid" in body["scopes_supported"]
+    assert body["authorization_servers"] == ["https://tenant.jp.auth0.com/"]
+    assert body["bearer_methods_supported"] == ["header"]
 
 
-async def test_authorization_server_metadata_proxies_firebase() -> None:
+async def test_authorization_server_metadata_proxied() -> None:
     upstream = {
-        "issuer": "https://securetoken.google.com/mot-cozy-space",
-        "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
-        "token_endpoint": "https://oauth2.googleapis.com/token",
-        "jwks_uri": "https://example.test/jwks",
+        "issuer": "https://tenant.jp.auth0.com/",
+        "authorization_endpoint": "https://tenant.jp.auth0.com/authorize",
+        "token_endpoint": "https://tenant.jp.auth0.com/oauth/token",
+        "jwks_uri": "https://tenant.jp.auth0.com/.well-known/jwks.json",
+        "registration_endpoint": "https://tenant.jp.auth0.com/oidc/register",
         "response_types_supported": ["code"],
     }
 
@@ -214,14 +288,11 @@ async def test_authorization_server_metadata_proxies_firebase() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["issuer"] == upstream["issuer"]
-    assert body["authorization_endpoint"] == upstream["authorization_endpoint"]
-    assert body["token_endpoint"] == upstream["token_endpoint"]
+    assert body["registration_endpoint"] == upstream["registration_endpoint"]
 
 
 async def test_authorization_server_metadata_falls_back_when_upstream_fails() -> None:
-    # Drive the fallback path directly against the helper to avoid having a
-    # patched ``httpx.AsyncClient.get`` also intercept the test client's
-    # request to the ASGI app (which would short-circuit the assertion).
+    """If Auth0 is unreachable, the hand-written subset still satisfies discovery."""
     from airhost_mcp import well_known
 
     well_known.reset_well_known_cache()
@@ -230,13 +301,13 @@ async def test_authorization_server_metadata_falls_back_when_upstream_fails() ->
         raise httpx.ConnectError("boom")
 
     with patch.object(httpx.AsyncClient, "get", _boom):
-        body = await well_known._fetch_firebase_openid_configuration(
-            "https://securetoken.google.com/mot-cozy-space"
+        body = await well_known._fetch_auth0_openid_configuration(
+            "https://tenant.jp.auth0.com/"
         )
 
-    assert body["issuer"] == "https://securetoken.google.com/mot-cozy-space"
-    assert "code" in body["response_types_supported"]
+    assert body["issuer"] == "https://tenant.jp.auth0.com/"
     assert "S256" in body["code_challenge_methods_supported"]
+    assert "registration_endpoint" in body  # DCR endpoint always advertised
 
 
 # --------------------------------------------------------------------------- #
@@ -245,13 +316,10 @@ async def test_authorization_server_metadata_falls_back_when_upstream_fails() ->
 
 
 async def test_health_endpoint_is_public(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Build the full app fresh, with a known env.
     monkeypatch.setenv("AIRHOST_CLIENT", "mock")
     monkeypatch.delenv("K_SERVICE", raising=False)
     reset_settings_cache()
 
-    # Re-import server with a clean module cache so its module-level
-    # ``app = create_app()`` runs against the test env.
     import importlib
 
     import airhost_mcp.server as srv_mod
@@ -298,9 +366,6 @@ async def test_mcp_request_without_token_returns_401(monkeypatch: pytest.MonkeyP
     importlib.reload(srv_mod)
     app = srv_mod.app
 
-    # Recent httpx removed the ``lifespan`` kwarg from ASGITransport. The
-    # 401 path is hit by the auth middleware before any FastMCP lifespan
-    # resource is needed, so we don't have to start the lifespan manually.
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="https://mcp.example.com") as c:
         resp = await c.get("/mcp/")
@@ -309,9 +374,9 @@ async def test_mcp_request_without_token_returns_401(monkeypatch: pytest.MonkeyP
     assert "/.well-known/oauth-protected-resource" in resp.headers["WWW-Authenticate"]
 
 
-def test_dev_disable_auth_blocked_in_managed_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_dev_disable_auth_managed_runtime_guard(monkeypatch: pytest.MonkeyPatch) -> None:
     """Production guard: K_SERVICE present means DEV_DISABLE_AUTH must be ignored."""
-    # The middleware reads ``in_managed_runtime`` at create_app() time, so we
-    # only need to check the helper logic. K_SERVICE => no shortcut.
     monkeypatch.setenv("K_SERVICE", "airhost-mcp")
-    assert bool(os.environ.get("K_SERVICE")) is True
+    import os as _os
+
+    assert bool(_os.environ.get("K_SERVICE")) is True

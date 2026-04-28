@@ -3,14 +3,15 @@
 #
 #   PROJECT_ID=my-proj REGION=asia-northeast1 \
 #     SESSION_BUCKET=my-bucket \
-#     FIREBASE_PROJECT_ID=mot-cozy-space \
+#     AUTH0_DOMAIN=mot-cozy-space.jp.auth0.com \
+#     AUTH0_AUDIENCE=https://airhost-mcp.example.com \
 #     MCP_PUBLIC_URL=https://airhost-mcp-xxxx.asia-northeast1.run.app \
 #     ./scripts/deploy_cloudrun.sh
 #
 # Prereqs (one-time):
 #   - gcloud auth login + gcloud config set project
 #   - billing enabled
-#   - Firebase Authentication enabled in this GCP project
+#   - Auth0 tenant + API created, OIDC Dynamic Application Registration enabled
 #   - GCS bucket created for session storage
 #   - Secret Manager secret MCP_ALLOWED_EMAILS already exists. Create it:
 #       printf 'alice@example.com,bob@example.com' \
@@ -23,7 +24,9 @@ set -euo pipefail
 REGION="${REGION:-asia-northeast1}"
 SERVICE="${SERVICE:-airhost-mcp}"
 SESSION_BUCKET="${SESSION_BUCKET:?SESSION_BUCKET env var required (existing GCS bucket name)}"
-FIREBASE_PROJECT_ID="${FIREBASE_PROJECT_ID:-${PROJECT_ID}}"
+AUTH0_DOMAIN="${AUTH0_DOMAIN:?AUTH0_DOMAIN env var required (e.g. tenant.region.auth0.com)}"
+AUTH0_AUDIENCE="${AUTH0_AUDIENCE:?AUTH0_AUDIENCE env var required (Auth0 API identifier)}"
+AUTH0_ISSUER="${AUTH0_ISSUER:-}"
 MCP_PUBLIC_URL="${MCP_PUBLIC_URL:-}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 
@@ -33,7 +36,10 @@ gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "$
 # Playwright + Chromium needs significantly more memory and CPU than a plain
 # Python service. 2Gi / 2 vCPU is a safe starting point; tune down later.
 ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
-ENV_VARS+=",FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}"
+ENV_VARS+=",AUTH0_DOMAIN=${AUTH0_DOMAIN},AUTH0_AUDIENCE=${AUTH0_AUDIENCE}"
+if [[ -n "${AUTH0_ISSUER}" ]]; then
+  ENV_VARS+=",AUTH0_ISSUER=${AUTH0_ISSUER}"
+fi
 if [[ -n "${MCP_PUBLIC_URL}" ]]; then
   ENV_VARS+=",MCP_PUBLIC_URL=${MCP_PUBLIC_URL}"
 fi
