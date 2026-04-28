@@ -40,6 +40,7 @@ from .base import (
     Reservation,
     ReservationUpdate,
     RoomType,
+    RoomTypeAvailability,
     RoomUnit,
 )
 
@@ -69,6 +70,48 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _booking_to_reservation(
+    b: dict[str, Any],
+    house_id: str,
+    room_type_id: str | None,
+    room_unit_id: str | None,
+) -> Reservation:
+    """Map one booking-calendar entry to our Reservation model.
+
+    Both regular bookings and blocks come through this path. ``blocked: true``
+    entries are surfaced with status="blocked" and the block reason in
+    ``notes``. Total amount isn't in the calendar payload — it lives on the
+    detail endpoint, which we'll call lazily if/when a tool needs it.
+    """
+    check_in = date.fromisoformat(b["starts_at"])
+    check_out = date.fromisoformat(b["ends_at"])
+    is_blocked = bool(b.get("blocked"))
+    raw_status = (b.get("status") or "").lower()
+    if is_blocked:
+        status: str = "blocked"
+    elif raw_status in ("confirmed", "cancelled", "blocked", "pending"):
+        status = raw_status
+    else:
+        status = "confirmed"
+
+    return Reservation(
+        reservation_id=b["id"],
+        listing_id=house_id,
+        room_type_id=room_type_id,
+        room_unit_id=room_unit_id,
+        external_uid=b.get("uid"),
+        guest_name=b.get("guest_name", "") or "",
+        check_in=check_in,
+        check_out=check_out,
+        nights=(check_out - check_in).days,
+        guests=b.get("guest_count") or 1,
+        total_jpy=None,
+        status=status,  # type: ignore[arg-type]
+        channel=b.get("original_source_i18n"),
+        notes=b.get("block_reason"),
+    )
+
+
 class BrowserAirhostClient(AirhostClient):
     def __init__(
         self,
@@ -94,6 +137,10 @@ class BrowserAirhostClient(AirhostClient):
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._login_lock = asyncio.Lock()
+        # Airhost's API requires a CSRF token on mutating requests; the
+        # token is rotated and the next valid value is returned in the body
+        # of any 401 we trigger. We cache it across calls and refresh on 401.
+        self._csrf_token: str | None = None
 
     # ----- lifecycle -----
 
@@ -324,26 +371,82 @@ class BrowserAirhostClient(AirhostClient):
         return out
 
     async def get_availability(self, listing_id: str, target_date: date) -> Availability:
-        async with self._page() as page:  # noqa: F841
-            raise NotImplementedError
+        """Per-RoomType availability for a single building on a single date.
+
+        Strategy:
+          1. Fetch RoomTypes (so we know the universe of room_units).
+          2. Fetch bookings for [target_date, target_date] from the calendar
+             API. The same response includes blocks (``blocked: true``); we
+             treat both as "occupied" for availability counting.
+          3. For each RoomType, count how many of its room_units are NOT in
+             the occupied set on target_date.
+        """
+        async with self._page() as page:
+            room_types = await self._fetch_room_types(page, listing_id)
+            bookings = await self._fetch_bookings(
+                page, house_id=listing_id, start_date=target_date, end_date=target_date
+            )
+
+            occupied = {
+                b.room_unit_id
+                for b in bookings
+                if b.room_unit_id and b.check_in <= target_date < b.check_out
+            }
+
+            rt_avail: list[RoomTypeAvailability] = []
+            for rt in room_types:
+                free = [u for u in rt.room_units if u.room_unit_id not in occupied]
+                rt_avail.append(
+                    RoomTypeAvailability(
+                        room_type_id=rt.room_type_id,
+                        name=rt.name,
+                        total_units=len(rt.room_units),
+                        available_units=len(free),
+                        nightly_rate_jpy=rt.nightly_rate_jpy,
+                    )
+                )
+
+            available = any(r.available_units > 0 for r in rt_avail)
+            cheapest = min(
+                (r.nightly_rate_jpy for r in rt_avail if r.available_units > 0 and r.nightly_rate_jpy),
+                default=None,
+            )
+            note = None if available else "no rooms available"
+            return Availability(
+                listing_id=listing_id,
+                target_date=target_date,
+                available=available,
+                nightly_rate_jpy=cheapest,
+                note=note,
+                room_types=rt_avail,
+            )
 
     async def get_reservations_on(
         self, listing_id: str, target_date: date
     ) -> list[Reservation]:
-        async with self._page() as page:  # noqa: F841
-            raise NotImplementedError
+        """All bookings (incl. blocks) occupying ``target_date`` at this house.
+
+        Convention: a booking with ``check_in <= target_date < check_out``
+        occupies the date — that matches Airhost's own checkout-by-morning
+        semantics (a 5/3→5/4 booking only occupies 5/3).
+        """
+        async with self._page() as page:
+            bookings = await self._fetch_bookings(
+                page, house_id=listing_id, start_date=target_date, end_date=target_date
+            )
+            return [b for b in bookings if b.check_in <= target_date < b.check_out]
 
     async def block_date(
         self, listing_id: str, target_date: date, reason: str | None = None
     ) -> BlockResult:
         async with self._page() as page:  # noqa: F841
-            raise NotImplementedError
+            raise NotImplementedError("block_date — TBD pending block-create API")
 
     async def update_reservation(
         self, reservation_id: str, patch: ReservationUpdate
     ) -> Reservation:
         async with self._page() as page:  # noqa: F841
-            raise NotImplementedError
+            raise NotImplementedError("update_reservation — TBD pending update API")
 
     async def list_reservations_in_range(
         self,
@@ -351,5 +454,117 @@ class BrowserAirhostClient(AirhostClient):
         start_date: date,
         end_date: date,
     ) -> list[Reservation]:
-        async with self._page() as page:  # noqa: F841
-            raise NotImplementedError
+        """All bookings overlapping the date range, optionally filtered by house.
+
+        Airhost's calendar endpoint requires a house_id, so when listing_id
+        is None we fan out across all houses the account manages and merge.
+        """
+        async with self._page() as page:
+            if listing_id is not None:
+                house_ids = [listing_id]
+            else:
+                house_ids = await self._all_house_ids(page)
+
+            results = await asyncio.gather(
+                *[
+                    self._fetch_bookings(
+                        page, house_id=hid, start_date=start_date, end_date=end_date
+                    )
+                    for hid in house_ids
+                ],
+                return_exceptions=True,
+            )
+
+            out: list[Reservation] = []
+            for hid, res in zip(house_ids, results, strict=True):
+                if isinstance(res, BaseException):
+                    logger.warning("bookings fetch failed for house %s: %s", hid, res)
+                    continue
+                out.extend(res)
+            return out
+
+    # ----- internal helpers shared by the read tools -----
+
+    async def _all_house_ids(self, page: Page) -> list[str]:
+        url = (
+            f"{self._API_BASE}/pms/houses"
+            "?locale=ja&page_num=1&page_size=200&field_sets_house=tag_list"
+        )
+        resp = await page.request.get(url)
+        if not resp.ok:
+            raise RuntimeError(
+                f"houses API HTTP {resp.status}: {(await resp.text())[:300]}"
+            )
+        payload = await resp.json()
+        return [h["id"] for h in (payload.get("data", []) or [])]
+
+    async def _api_post(
+        self,
+        page: Page,
+        url: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST helper that handles Airhost's CSRF-token rotation.
+
+        On 401 ``api_unauthorized`` the response body contains the next
+        valid ``csrf_token``; we cache it, retry the request once with
+        ``X-CSRF-Token`` set, and surface any persistent failure.
+        """
+        headers = {"X-CSRF-Token": self._csrf_token} if self._csrf_token else {}
+        resp = await page.request.post(url, data=body, headers=headers)
+
+        if resp.status == 401:
+            try:
+                err = await resp.json()
+                next_token = (err.get("data") or {}).get("csrf_token")
+            except Exception:
+                next_token = None
+            if next_token:
+                self._csrf_token = next_token
+                resp = await page.request.post(
+                    url, data=body, headers={"X-CSRF-Token": next_token}
+                )
+
+        if not resp.ok:
+            raise RuntimeError(
+                f"Airhost POST {url.rsplit('/', 1)[-1]} HTTP {resp.status}: "
+                f"{(await resp.text())[:300]}"
+            )
+        payload = await resp.json()
+        if not payload.get("success"):
+            raise RuntimeError(f"Airhost POST {url} failed: {payload}")
+        return payload
+
+    async def _fetch_bookings(
+        self,
+        page: Page,
+        *,
+        house_id: str,
+        start_date: date,
+        end_date: date,
+        room_unit_ids: list[str] | None = None,
+    ) -> list[Reservation]:
+        """Hit the Airhost booking-calendar query API and flatten the result.
+
+        The API nests bookings as ``data[i].room_units[j].bookings[k]``;
+        ``blocked: true`` rows are blocks, otherwise they're regular
+        reservations.
+        """
+        url = f"{self._API_BASE}/pms/booking_calendar/bookings/query?locale=ja"
+        body = {
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "house_id": house_id,
+            "house_tags": [],
+            "room_unit_ids": room_unit_ids or [],
+        }
+        payload = await self._api_post(page, url, body)
+
+        out: list[Reservation] = []
+        for room_type in payload.get("data", []) or []:
+            rt_id = room_type.get("id")
+            for room_unit in room_type.get("room_units", []) or []:
+                ru_id = room_unit.get("id")
+                for b in room_unit.get("bookings", []) or []:
+                    out.append(_booking_to_reservation(b, house_id, rt_id, ru_id))
+        return out

@@ -48,17 +48,40 @@ class Listing(BaseModel):
     room_types: list[RoomType] = Field(default_factory=list)
 
 
-class Availability(BaseModel):
-    listing_id: str
-    target_date: date
-    available: bool
+class RoomTypeAvailability(BaseModel):
+    """Per-RoomType slice of availability on a single date.
+
+    ``total_units`` and ``available_units`` make cross-room moves visible:
+    e.g. for a 3-night stay we can see "101 has 1 free unit on day 1, 103
+    has 1 free unit on day 2, both empty on day 3" and route the guest.
+    """
+
+    room_type_id: str
+    name: str
+    total_units: int
+    available_units: int
     nightly_rate_jpy: int | None = None
+
+
+class Availability(BaseModel):
+    listing_id: str  # = house_id
+    target_date: date
+    available: bool  # True iff any room_type has available_units > 0
+    nightly_rate_jpy: int | None = None  # cheapest available room type's rate
     note: str | None = None
+    room_types: list[RoomTypeAvailability] = Field(default_factory=list)
 
 
 class Reservation(BaseModel):
     reservation_id: str
-    listing_id: str
+    listing_id: str  # = house_id
+    # The hierarchy below the building. Set when known (always set when the
+    # data comes from the Airhost booking-calendar API).
+    room_type_id: str | None = None
+    room_unit_id: str | None = None
+    # The channel-side identifier — e.g. Airbnb's "HMxxxx", Booking.com's
+    # numeric ref, jalan's UID. Useful for cross-referencing OTAs.
+    external_uid: str | None = None
     guest_name: str
     check_in: date
     check_out: date
@@ -66,8 +89,8 @@ class Reservation(BaseModel):
     guests: int = 1
     total_jpy: int | None = None
     status: ReservationStatus = "confirmed"
-    channel: str | None = None
-    notes: str | None = None
+    channel: str | None = None  # e.g. "Airbnb", "Booking.com", "じゃらん"
+    notes: str | None = None  # populated from block_reason for blocked entries
 
 
 class BlockResult(BaseModel):

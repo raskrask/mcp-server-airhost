@@ -7,6 +7,9 @@ from .base import (
     Listing,
     Reservation,
     ReservationUpdate,
+    RoomType,
+    RoomTypeAvailability,
+    RoomUnit,
 )
 from .factory import build_airhost_client
 
@@ -17,5 +20,8 @@ __all__ = [
     "Listing",
     "Reservation",
     "ReservationUpdate",
+    "RoomType",
+    "RoomTypeAvailability",
+    "RoomUnit",
     "build_airhost_client",
 ]
