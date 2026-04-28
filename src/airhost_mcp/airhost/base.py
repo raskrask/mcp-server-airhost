@@ -88,6 +88,8 @@ class Reservation(BaseModel):
     nights: int
     guests: int = 1
     total_jpy: int | None = None
+    amount_due_jpy: int | None = None  # outstanding balance (booking - paid)
+    payment_status: str | None = None  # e.g. "paid", "balance_due"
     status: ReservationStatus = "confirmed"
     channel: str | None = None  # e.g. "Airbnb", "Booking.com", "じゃらん"
     notes: str | None = None  # populated from block_reason for blocked entries

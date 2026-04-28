@@ -438,7 +438,11 @@ class BrowserAirhostClient(AirhostClient):
             bookings = await self._fetch_bookings(
                 page, house_id=listing_id, start_date=target_date, end_date=target_date
             )
-            return [b for b in bookings if b.check_in <= target_date < b.check_out]
+            occupying = [
+                b for b in bookings if b.check_in <= target_date < b.check_out
+            ]
+            await self._enrich_with_invoice(page, occupying)
+            return occupying
 
     async def block_date(
         self, listing_id: str, target_date: date, reason: str | None = None
@@ -485,6 +489,7 @@ class BrowserAirhostClient(AirhostClient):
                     logger.warning("bookings fetch failed for house %s: %s", hid, res)
                     continue
                 out.extend(res)
+            await self._enrich_with_invoice(page, out)
             return out
 
     # ----- internal helpers shared by the read tools -----
@@ -598,6 +603,72 @@ class BrowserAirhostClient(AirhostClient):
         if not payload.get("success"):
             raise RuntimeError(f"Airhost POST {url} failed: {payload}")
         return payload
+
+    async def _fetch_booking_invoice(
+        self, page: Page, booking_id: str
+    ) -> dict[str, Any] | None:
+        """GET booking detail to pull invoice_summary (total / amount_due / status).
+
+        We deliberately ignore the rest of the very-large response (rollout
+        flags, checkin_settings, etc.). Returns None on failure rather than
+        raising, since one stale booking shouldn't tank a whole list.
+        """
+        url = (
+            f"{self._API_BASE}/pms/checkin/bookings/{booking_id}"
+            "?locale=ja&field_sets_booking=rich&field_sets_house=basic"
+        )
+        headers = await self._build_headers(page)
+        try:
+            resp = await page.request.get(url, headers=headers)
+        except Exception as exc:
+            logger.warning("booking detail %s request failed: %s", booking_id, exc)
+            return None
+        if not resp.ok:
+            return None
+        try:
+            payload = await resp.json()
+        except Exception:
+            return None
+        if not payload.get("success"):
+            return None
+        return payload.get("data") or {}
+
+    async def _enrich_with_invoice(
+        self, page: Page, reservations: list[Reservation]
+    ) -> None:
+        """Populate total_jpy / amount_due_jpy / payment_status in-place.
+
+        Skips blocks (no invoice). Fetches details concurrently with a
+        small semaphore so a 60-day range across many rooms doesn't open
+        hundreds of simultaneous connections.
+        """
+        targets = [r for r in reservations if r.status != "blocked"]
+        if not targets:
+            return
+
+        sem = asyncio.Semaphore(8)
+
+        async def one(r: Reservation) -> None:
+            async with sem:
+                data = await self._fetch_booking_invoice(page, r.reservation_id)
+            if not data:
+                return
+            summary = data.get("invoice_summary") or {}
+            total = summary.get("total")
+            due = summary.get("amount_due")
+            if total is not None:
+                try:
+                    r.total_jpy = int(float(total))
+                except (TypeError, ValueError):
+                    pass
+            if due is not None:
+                try:
+                    r.amount_due_jpy = int(float(due))
+                except (TypeError, ValueError):
+                    pass
+            r.payment_status = summary.get("payment_status") or r.payment_status
+
+        await asyncio.gather(*[one(r) for r in targets], return_exceptions=True)
 
     async def _fetch_bookings(
         self,
