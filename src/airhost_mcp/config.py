@@ -20,10 +20,13 @@ class Settings(BaseSettings):
     port: int = 8080
     mcp_mount_path: str = "/mcp"
 
-    # ---- OAuth 2.1 / Firebase Authentication ----
-    # GCP project hosting Firebase Auth. The issuer is
-    # ``https://securetoken.google.com/<firebase_project_id>``.
-    firebase_project_id: str = ""
+    # ---- OAuth 2.1 / Auth0 ----
+    # Auth0 tenant domain, e.g. "mot-cozy-space.jp.auth0.com".
+    auth0_domain: str = ""
+    # API identifier configured in Auth0; the JWT ``aud`` claim must match.
+    auth0_audience: str = ""
+    # Optional explicit issuer override. Defaults to "https://{auth0_domain}/".
+    auth0_issuer: str = ""
     # Comma-separated allowlist of authorized email addresses. Compared
     # case-insensitively against the verified ``email`` claim.
     mcp_allowed_emails: str = ""

@@ -1,17 +1,21 @@
-"""OAuth 2.1 bearer-token validation backed by Firebase Authentication.
+"""OAuth 2.1 bearer-token validation backed by Auth0.
 
-The MCP server is a Protected Resource (RFC 9728); Firebase Authentication
-acts as the Authorization Server. Clients (e.g. claude.ai) obtain a Firebase
-ID token via the standard browser sign-in flow and present it as
-``Authorization: Bearer <jwt>`` on every MCP request.
+The MCP server is a Protected Resource (RFC 9728); Auth0 acts as the
+Authorization Server. Clients (e.g. claude.ai) obtain an Auth0 access token
+via the Authorization Code + PKCE flow (driven through Google login) and
+present it as ``Authorization: Bearer <jwt>`` on every MCP request.
 
 Validation steps performed by :func:`verify_oauth_token`:
 
 1. Extract the bearer token from the ``Authorization`` header.
-2. Verify signature, issuer, audience, and expiry via
-   ``firebase_admin.auth.verify_id_token``.
-3. Require ``email_verified`` true.
-4. Require ``email`` to be a member of the ``MCP_ALLOWED_EMAILS`` allowlist
+2. Verify signature, issuer, audience, and expiry against Auth0's JWKS.
+3. Require an email claim (Auth0 doesn't put email in access tokens by
+   default — see README for the Auth0 Action that copies it as a custom
+   claim ``https://airhost-mcp/email``). We accept either the standard
+   ``email`` claim or the namespaced custom claim.
+4. Require ``email_verified`` true (custom claim
+   ``https://airhost-mcp/email_verified`` accepted as fallback).
+5. Require ``email`` to be a member of the ``MCP_ALLOWED_EMAILS`` allowlist
    (case-insensitive).
 
 Every failure returns HTTP 401 with a ``WWW-Authenticate: Bearer`` challenge
@@ -21,42 +25,78 @@ restart the OAuth dance cleanly.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import threading
+import time
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, Request, status
+from jose import jwt
+from jose.exceptions import JWTError
 
 from .config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_FIREBASE_INIT_LOCK = threading.Lock()
-_firebase_ready: bool = False
+# Custom-claim names matching the Auth0 Action recommended in README. Auth0
+# requires custom claim keys to be namespaced URLs.
+_EMAIL_CLAIM_NS = "https://airhost-mcp/email"
+_EMAIL_VERIFIED_CLAIM_NS = "https://airhost-mcp/email_verified"
+
+# In-process JWKS cache. Auth0 rotates signing keys infrequently; 10 minutes
+# strikes a balance between freshness and avoiding a fetch per request.
+_JWKS_TTL_SECONDS = 600.0
+_jwks_lock = asyncio.Lock()
+_jwks_cache: dict[str, Any] | None = None
+_jwks_cache_at: float = 0.0
 
 
-def _ensure_firebase_initialized() -> None:
-    """Lazy, idempotent ``firebase_admin`` initialization.
+def reset_jwks_cache() -> None:
+    """Test helper: drop the cached JWKS so the next verify call re-fetches."""
+    global _jwks_cache, _jwks_cache_at
+    _jwks_cache = None
+    _jwks_cache_at = 0.0
 
-    On Cloud Run the SDK auto-discovers Application Default Credentials, so no
-    service-account key file is required. Locally the operator can set
-    ``GOOGLE_APPLICATION_CREDENTIALS`` to a downloaded key.
+
+def _issuer(settings: Any) -> str:
+    """Resolve the Auth0 issuer URL.
+
+    Auth0's standard issuer is ``https://{domain}/`` (trailing slash matters —
+    the iss claim in tokens carries the slash). Allow override via env for
+    custom domain setups.
     """
-    global _firebase_ready
-    if _firebase_ready:
-        return
-    with _FIREBASE_INIT_LOCK:
-        if _firebase_ready:
-            return
-        import firebase_admin  # imported lazily to keep test startup fast
+    if settings.auth0_issuer:
+        return settings.auth0_issuer
+    if not settings.auth0_domain:
+        return ""
+    return f"https://{settings.auth0_domain}/"
 
-        if not firebase_admin._apps:  # type: ignore[attr-defined]
-            settings = get_settings()
-            options: dict[str, Any] = {}
-            if settings.firebase_project_id:
-                options["projectId"] = settings.firebase_project_id
-            firebase_admin.initialize_app(options=options or None)
-        _firebase_ready = True
+
+async def _fetch_jwks(domain: str) -> dict[str, Any]:
+    """Fetch and cache Auth0's JWKS document."""
+    global _jwks_cache, _jwks_cache_at
+
+    now = time.monotonic()
+    if _jwks_cache is not None and (now - _jwks_cache_at) < _JWKS_TTL_SECONDS:
+        return _jwks_cache
+
+    async with _jwks_lock:
+        # Double-check after the lock — another coroutine may have populated
+        # the cache while we waited.
+        now = time.monotonic()
+        if _jwks_cache is not None and (now - _jwks_cache_at) < _JWKS_TTL_SECONDS:
+            return _jwks_cache
+
+        url = f"https://{domain}/.well-known/jwks.json"
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            resp = await http.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+        _jwks_cache = data
+        _jwks_cache_at = now
+        return data
 
 
 def _challenge_header(request: Request) -> dict[str, str]:
@@ -81,15 +121,26 @@ def _unauthorized(request: Request, detail: str) -> HTTPException:
     )
 
 
+def _extract_email(claims: dict[str, Any]) -> tuple[str | None, bool]:
+    """Pull the user's email + verification status out of token claims.
+
+    Auth0 access tokens don't include ``email`` by default; readers should
+    add an Auth0 Action that copies the user's email into the access token
+    as a namespaced custom claim. We accept both the standard claim and the
+    namespaced one so either Auth0 setup works.
+    """
+    email = claims.get(_EMAIL_CLAIM_NS) or claims.get("email")
+    verified = claims.get(_EMAIL_VERIFIED_CLAIM_NS)
+    if verified is None:
+        verified = claims.get("email_verified")
+    return (email if isinstance(email, str) and email else None, bool(verified))
+
+
 async def verify_oauth_token(request: Request) -> dict[str, Any]:
     """Validate the request's bearer token and enforce the email allowlist.
 
-    Returns the verified Firebase ID-token claims on success. On any failure
-    raises ``HTTPException(401)`` with a populated ``WWW-Authenticate`` header.
-
-    The function is async to fit FastAPI dependency / middleware idioms; the
-    underlying Firebase call is synchronous but cheap (in-process JWKS cache),
-    so we don't bother offloading to a thread.
+    Returns the verified token claims on success. On any failure raises
+    ``HTTPException(401)`` with a populated ``WWW-Authenticate`` header.
     """
     settings = get_settings()
 
@@ -101,36 +152,72 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
         raise _unauthorized(request, "empty bearer token")
 
     if not settings.allowed_email_set:
-        # Misconfiguration: allowlist must be populated before deployment. We
-        # still emit 401 (not 500) so MCP clients re-authenticate cleanly; the
-        # log is the operator's signal.
         logger.error("MCP_ALLOWED_EMAILS is empty; rejecting all requests")
         raise _unauthorized(request, "server allowlist not configured")
 
+    if not settings.auth0_domain or not settings.auth0_audience:
+        logger.error("AUTH0_DOMAIN and AUTH0_AUDIENCE must be set")
+        raise _unauthorized(request, "auth backend not configured")
+
+    issuer = _issuer(settings)
+
+    # Fetch JWKS and pick the key matching the token's kid header.
     try:
-        _ensure_firebase_initialized()
-    except Exception as exc:  # pragma: no cover - init failure is exceptional
-        logger.exception("firebase_admin initialization failed: %s", exc)
+        unverified_header = jwt.get_unverified_header(token)
+    except JWTError as exc:
+        logger.info("malformed JWT header: %s", exc)
+        raise _unauthorized(request, "malformed token") from exc
+
+    kid = unverified_header.get("kid")
+    if not kid:
+        raise _unauthorized(request, "token missing key id")
+
+    try:
+        jwks = await _fetch_jwks(settings.auth0_domain)
+    except Exception as exc:
+        logger.exception("JWKS fetch failed: %s", exc)
         raise _unauthorized(request, "auth backend unavailable") from exc
 
+    matching_key = next(
+        (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
+    )
+    if matching_key is None:
+        # The signing key may have rotated since our cache was filled. Drop
+        # the cache and try once more before giving up.
+        reset_jwks_cache()
+        try:
+            jwks = await _fetch_jwks(settings.auth0_domain)
+        except Exception as exc:
+            logger.exception("JWKS refresh failed: %s", exc)
+            raise _unauthorized(request, "auth backend unavailable") from exc
+        matching_key = next(
+            (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
+        )
+    if matching_key is None:
+        raise _unauthorized(request, "no matching signing key")
+
     try:
-        from firebase_admin import auth as fb_auth  # local import: lazy
+        claims = jwt.decode(
+            token,
+            matching_key,
+            algorithms=["RS256"],
+            audience=settings.auth0_audience,
+            issuer=issuer,
+        )
+    except JWTError as exc:
+        logger.info("Auth0 JWT rejected: %s", exc)
+        raise _unauthorized(request, "invalid token") from exc
 
-        claims = fb_auth.verify_id_token(token, check_revoked=False)
-    except Exception as exc:
-        logger.info("firebase verify_id_token rejected token: %s", exc)
-        raise _unauthorized(request, "invalid id token") from exc
-
-    if not claims.get("email_verified"):
+    email, verified = _extract_email(claims)
+    if email is None:
+        raise _unauthorized(
+            request, "token missing email claim (Auth0 Action required)"
+        )
+    if not verified:
         raise _unauthorized(request, "email not verified")
 
-    email = claims.get("email")
-    if not isinstance(email, str) or not email:
-        raise _unauthorized(request, "id token missing email claim")
     email_lc = email.lower()
     if email_lc not in settings.allowed_email_set:
-        # Per the brief: allowlist failures stay 401 (not 403) so MCP clients
-        # transparently re-trigger the OAuth flow.
         raise _unauthorized(request, "email not in allowlist")
 
     request.state.user_email = email_lc
