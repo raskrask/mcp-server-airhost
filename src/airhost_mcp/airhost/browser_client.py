@@ -6,9 +6,11 @@ real Chromium via Playwright. Sessions are persisted as Playwright
 ``SessionStore`` so a freshly-started Cloud Run container can resume without
 re-doing the password + email-MFA dance.
 
-Implementation status: scaffolding only. The login flow and the per-tool
-selectors / endpoints depend on the actual Airhost UI and are filled in once
-the real pages are inspected. Methods raise ``NotImplementedError`` until then.
+Once logged in, we don't actually scrape the DOM for most operations —
+Airhost's PMS frontend speaks to ``api2.airhost.co/api/one/...`` JSON
+endpoints, and Playwright's ``page.request`` reuses the cookie/session jar
+from the browser context, so we can call those APIs directly. That's much
+more stable than HTML scraping and avoids the React rerender timing fights.
 """
 
 from __future__ import annotations
@@ -184,11 +186,47 @@ class BrowserAirhostClient(AirhostClient):
 
             logger.info("airhost login completed for %s", self._username)
 
-    # ----- tool methods (TBD against real UI) -----
+    # ----- tool methods -----
+
+    _API_BASE = "https://api2.airhost.co/api/one"
 
     async def list_listings(self) -> list[Listing]:
-        async with self._page() as page:  # noqa: F841 (page used by impl)
-            raise NotImplementedError("scrape Airhost listings page")
+        """Fetch every house this account manages.
+
+        Calls ``GET /api/one/pms/houses`` directly via the Playwright request
+        context (so the session cookie set during login is reused). The page
+        size is intentionally large — Airhost paginates this endpoint, but
+        2-user setups won't realistically have thousands of properties.
+        """
+        async with self._page() as page:
+            url = (
+                f"{self._API_BASE}/pms/houses"
+                "?locale=ja&sorts=created_at%3Adesc"
+                "&page_num=1&page_size=200"
+                "&field_sets_house=tag_list"
+            )
+            resp = await page.request.get(url)
+            if not resp.ok:
+                body = await resp.text()
+                raise RuntimeError(
+                    f"Airhost houses API returned HTTP {resp.status}: {body[:300]}"
+                )
+            payload = await resp.json()
+            if not payload.get("success"):
+                raise RuntimeError(f"Airhost houses API failed: {payload}")
+
+            return [
+                Listing(
+                    listing_id=item["id"],
+                    name=item.get("internal_name") or item.get("name", ""),
+                    address=item.get("address"),
+                    bedrooms=None,
+                    max_guests=None,
+                    nightly_rate_jpy=None,
+                    timezone="Asia/Tokyo",
+                )
+                for item in payload.get("data", [])
+            ]
 
     async def get_availability(self, listing_id: str, target_date: date) -> Availability:
         async with self._page() as page:  # noqa: F841
