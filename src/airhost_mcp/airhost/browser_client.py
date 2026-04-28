@@ -137,9 +137,13 @@ class BrowserAirhostClient(AirhostClient):
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
         self._login_lock = asyncio.Lock()
-        # Airhost's API requires a CSRF token on mutating requests; the
-        # token is rotated and the next valid value is returned in the body
-        # of any 401 we trigger. We cache it across calls and refresh on 401.
+        # Airhost's API requires two custom headers on every request:
+        #   * x-ah-tenant   — account id, stable per Airhost account, lives
+        #                     in localStorage as ``accountId``.
+        #   * x-csrf-token  — rotates per request; the server returns the
+        #                     next valid value in 401 responses, so we
+        #                     cache + refresh on 401.
+        self._tenant_id: str | None = None
         self._csrf_token: str | None = None
 
     # ----- lifecycle -----
@@ -498,32 +502,92 @@ class BrowserAirhostClient(AirhostClient):
         payload = await resp.json()
         return [h["id"] for h in (payload.get("data", []) or [])]
 
+    async def _ensure_tenant_id(self, page: Page) -> str:
+        """Resolve the x-ah-tenant header value.
+
+        Primary source is ``localStorage.accountId`` (set by Airhost's web
+        bundle on login). Falls back to the account API.
+        """
+        if self._tenant_id:
+            return self._tenant_id
+
+        try:
+            tid = await page.evaluate("() => localStorage.getItem('accountId')")
+        except Exception:
+            tid = None
+        if tid:
+            self._tenant_id = tid
+            return tid
+
+        resp = await page.request.get(f"{self._API_BASE}/pms/account?locale=ja")
+        if resp.ok:
+            data = await resp.json()
+            tid = (data.get("data") or {}).get("account", {}).get("id")
+            if tid:
+                self._tenant_id = tid
+                return tid
+
+        raise RuntimeError(
+            "could not resolve Airhost x-ah-tenant id "
+            "(neither localStorage.accountId nor /pms/account returned a value)"
+        )
+
+    async def _ensure_csrf_token(
+        self, page: Page, *, force_refresh: bool = False
+    ) -> str:
+        """Fetch the x-csrf-token from /pms/settings/preflights.
+
+        Airhost ships the CSRF token in the body of the preflights response
+        as ``data.csrf_token`` (not in headers, not in cookies, not in
+        localStorage). The frontend's axios interceptor reads this once
+        and replays it on every call. We do the same.
+        """
+        if self._csrf_token and not force_refresh:
+            return self._csrf_token
+
+        resp = await page.request.get(
+            f"{self._API_BASE}/pms/settings/preflights"
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"preflights GET HTTP {resp.status}: {(await resp.text())[:200]}"
+            )
+        data = await resp.json()
+        token = (data.get("data") or {}).get("csrf_token")
+        if not token:
+            raise RuntimeError("preflights response did not contain csrf_token")
+        self._csrf_token = token
+        return token
+
+    async def _build_headers(self, page: Page) -> dict[str, str]:
+        tenant = await self._ensure_tenant_id(page)
+        csrf = await self._ensure_csrf_token(page)
+        return {
+            "x-ah-tenant": tenant,
+            "x-csrf-token": csrf,
+            "accept": "application/json",
+            "content-type": "application/json",
+            "x-user-os-timezone": "Asia/Tokyo",
+        }
+
     async def _api_post(
         self,
         page: Page,
         url: str,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        """POST helper that handles Airhost's CSRF-token rotation.
-
-        On 401 ``api_unauthorized`` the response body contains the next
-        valid ``csrf_token``; we cache it, retry the request once with
-        ``X-CSRF-Token`` set, and surface any persistent failure.
-        """
-        headers = {"X-CSRF-Token": self._csrf_token} if self._csrf_token else {}
+        """POST helper. On 401, refresh CSRF from preflights and retry once."""
+        headers = await self._build_headers(page)
         resp = await page.request.post(url, data=body, headers=headers)
 
         if resp.status == 401:
-            try:
-                err = await resp.json()
-                next_token = (err.get("data") or {}).get("csrf_token")
-            except Exception:
-                next_token = None
-            if next_token:
-                self._csrf_token = next_token
-                resp = await page.request.post(
-                    url, data=body, headers={"X-CSRF-Token": next_token}
-                )
+            # The error body advertises a "next" csrf_token, but in practice
+            # only re-fetching from /pms/settings/preflights yields a token
+            # the server actually accepts. So we refresh from the canonical
+            # source and retry once.
+            await self._ensure_csrf_token(page, force_refresh=True)
+            headers = await self._build_headers(page)
+            resp = await page.request.post(url, data=body, headers=headers)
 
         if not resp.ok:
             raise RuntimeError(
@@ -546,17 +610,27 @@ class BrowserAirhostClient(AirhostClient):
     ) -> list[Reservation]:
         """Hit the Airhost booking-calendar query API and flatten the result.
 
-        The API nests bookings as ``data[i].room_units[j].bookings[k]``;
-        ``blocked: true`` rows are blocks, otherwise they're regular
-        reservations.
+        ``house_id`` alone does NOT scope the query — leaving
+        ``room_unit_ids`` empty makes Airhost return bookings for every
+        unit on the account. So if the caller didn't pass an explicit list,
+        we resolve the room_units from this house's room_types and use
+        those.
         """
+        if room_unit_ids is None:
+            room_types = await self._fetch_room_types(page, house_id)
+            room_unit_ids = [
+                u.room_unit_id for rt in room_types for u in rt.room_units
+            ]
+            if not room_unit_ids:
+                return []  # house has no room_units → nothing to query
+
         url = f"{self._API_BASE}/pms/booking_calendar/bookings/query?locale=ja"
         body = {
             "start_date": start_date.isoformat(),
             "end_date": end_date.isoformat(),
             "house_id": house_id,
             "house_tags": [],
-            "room_unit_ids": room_unit_ids or [],
+            "room_unit_ids": room_unit_ids,
         }
         payload = await self._api_post(page, url, body)
 
