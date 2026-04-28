@@ -2,7 +2,7 @@
 
 Exposes a FastMCP server over Streamable HTTP, mounted under
 ``MCP_MOUNT_PATH`` of a FastAPI app. Every request to the mount path is
-gated by Bearer-token auth.
+gated by an OAuth 2.1 bearer token issued by Firebase Authentication.
 
 Run locally::
 
@@ -23,9 +23,18 @@ import uvicorn
 from fastapi import FastAPI
 
 from .airhost import build_airhost_client
-from .auth import verify_bearer
+from .auth import verify_oauth_token
 from .config import get_settings
 from .tools import register_tools
+from .well_known import build_router as build_well_known_router
+
+
+def _is_well_known_path(path: str) -> bool:
+    return path.startswith("/.well-known/")
+
+
+def _is_health_path(path: str) -> bool:
+    return path == "/health"
 
 
 def create_app() -> FastAPI:
@@ -73,23 +82,40 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    # Apply Bearer auth to every request to the MCP mount path.
-    @app.middleware("http")
-    async def bearer_gate(request, call_next):
-        path = request.url.path
-        mount = settings.mcp_mount_path.rstrip("/")
-        if path == mount or path.startswith(mount + "/"):
-            try:
-                verify_bearer(request)
-            except Exception as exc:  # HTTPException
-                from fastapi.responses import JSONResponse
+    # OAuth discovery: /.well-known/oauth-protected-resource +
+    # /.well-known/oauth-authorization-server. Mounted on the FastAPI app
+    # itself so they sit at the public origin root, not under /mcp.
+    app.include_router(build_well_known_router())
 
-                status_code = getattr(exc, "status_code", 500)
-                detail = getattr(exc, "detail", "auth error")
-                headers = getattr(exc, "headers", None) or {}
-                return JSONResponse(
-                    {"error": detail}, status_code=status_code, headers=headers
-                )
+    # Detect the Cloud Run / managed runtime so DEV_DISABLE_AUTH cannot
+    # accidentally be honored in production. Cloud Run injects K_SERVICE for
+    # every revision; its presence means "we are running on Cloud Run".
+    in_managed_runtime = bool(os.environ.get("K_SERVICE"))
+
+    @app.middleware("http")
+    async def oauth_gate(request, call_next):
+        path = request.url.path
+        if _is_health_path(path) or _is_well_known_path(path):
+            return await call_next(request)
+
+        current = get_settings()
+        if current.dev_disable_auth and not in_managed_runtime:
+            # Local-dev escape hatch. Logged loudly on the first request per
+            # process so it's obvious in stderr.
+            logger.warning("DEV_DISABLE_AUTH=true — skipping OAuth verification")
+            return await call_next(request)
+
+        try:
+            await verify_oauth_token(request)
+        except Exception as exc:  # HTTPException
+            from fastapi.responses import JSONResponse
+
+            status_code = getattr(exc, "status_code", 500)
+            detail = getattr(exc, "detail", "auth error")
+            headers = getattr(exc, "headers", None) or {}
+            return JSONResponse(
+                {"error": detail}, status_code=status_code, headers=headers
+            )
         return await call_next(request)
 
     app.mount(settings.mcp_mount_path, mcp.streamable_http_app())
@@ -97,6 +123,7 @@ def create_app() -> FastAPI:
     return app
 
 
+logger = logging.getLogger(__name__)
 app = create_app()
 
 

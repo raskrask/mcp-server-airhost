@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,10 +16,25 @@ class Settings(BaseSettings):
     )
 
     # MCP HTTP server
-    mcp_bearer_tokens: str = Field(default="", description="Comma-separated bearer tokens.")
     host: str = "0.0.0.0"
     port: int = 8080
     mcp_mount_path: str = "/mcp"
+
+    # ---- OAuth 2.1 / Firebase Authentication ----
+    # GCP project hosting Firebase Auth. The issuer is
+    # ``https://securetoken.google.com/<firebase_project_id>``.
+    firebase_project_id: str = ""
+    # Comma-separated allowlist of authorized email addresses. Compared
+    # case-insensitively against the verified ``email`` claim.
+    mcp_allowed_emails: str = ""
+    # Public origin (and optional path) of this MCP server, used in OAuth
+    # protected-resource metadata. If empty, derived from the first incoming
+    # request's ``base_url`` and cached.
+    mcp_public_url: str = ""
+    # Local-dev escape hatch: skip auth entirely. NEVER set true in production.
+    # The middleware additionally refuses to honor this when the Cloud Run
+    # K_SERVICE env var is present (see ``server.py``).
+    dev_disable_auth: bool = False
 
     # Airhost
     airhost_login_url: str = "https://pms.airhost.co/ja/sign_in"
@@ -62,14 +76,12 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    @field_validator("mcp_bearer_tokens")
-    @classmethod
-    def _strip_tokens(cls, v: str) -> str:
-        return ",".join(t.strip() for t in v.split(",") if t.strip())
-
     @property
-    def bearer_token_set(self) -> set[str]:
-        return {t for t in self.mcp_bearer_tokens.split(",") if t}
+    def allowed_email_set(self) -> frozenset[str]:
+        """Lower-cased, stripped allowlist of accepted user emails."""
+        return frozenset(
+            e.strip().lower() for e in self.mcp_allowed_emails.split(",") if e.strip()
+        )
 
 
 _settings: Settings | None = None
@@ -80,3 +92,10 @@ def get_settings() -> Settings:
     if _settings is None:
         _settings = Settings()
     return _settings
+
+
+def reset_settings_cache() -> None:
+    """Test helper: drop the memoized settings so the next ``get_settings()``
+    call re-reads the process environment."""
+    global _settings
+    _settings = None

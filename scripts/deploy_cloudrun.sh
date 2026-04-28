@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # Deploy airhost-mcp to Cloud Run. Set env in your shell or .env and run.
 #
-#   PROJECT_ID=my-proj REGION=asia-northeast1 ./scripts/deploy_cloudrun.sh
+#   PROJECT_ID=my-proj REGION=asia-northeast1 \
+#     SESSION_BUCKET=my-bucket \
+#     FIREBASE_PROJECT_ID=mot-cozy-space \
+#     MCP_PUBLIC_URL=https://airhost-mcp-xxxx.asia-northeast1.run.app \
+#     ./scripts/deploy_cloudrun.sh
 #
-# Prereqs: gcloud auth login, gcloud config set project, billing enabled,
-# and a GCS bucket created for session storage.
+# Prereqs (one-time):
+#   - gcloud auth login + gcloud config set project
+#   - billing enabled
+#   - Firebase Authentication enabled in this GCP project
+#   - GCS bucket created for session storage
+#   - Secret Manager secret MCP_ALLOWED_EMAILS already exists. Create it:
+#       printf 'alice@example.com,bob@example.com' \
+#         | gcloud secrets create MCP_ALLOWED_EMAILS --data-file=-
+#     and grant the runner SA roles/secretmanager.secretAccessor on it.
 
 set -euo pipefail
 
@@ -12,6 +23,8 @@ set -euo pipefail
 REGION="${REGION:-asia-northeast1}"
 SERVICE="${SERVICE:-airhost-mcp}"
 SESSION_BUCKET="${SESSION_BUCKET:?SESSION_BUCKET env var required (existing GCS bucket name)}"
+FIREBASE_PROJECT_ID="${FIREBASE_PROJECT_ID:-${PROJECT_ID}}"
+MCP_PUBLIC_URL="${MCP_PUBLIC_URL:-}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 
 echo "Building image with Cloud Build..."
@@ -19,6 +32,12 @@ gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "$
 
 # Playwright + Chromium needs significantly more memory and CPU than a plain
 # Python service. 2Gi / 2 vCPU is a safe starting point; tune down later.
+ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
+ENV_VARS+=",FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID}"
+if [[ -n "${MCP_PUBLIC_URL}" ]]; then
+  ENV_VARS+=",MCP_PUBLIC_URL=${MCP_PUBLIC_URL}"
+fi
+
 DEPLOY_ARGS=(
   "${SERVICE}"
   --image "gcr.io/${PROJECT_ID}/${SERVICE}:latest"
@@ -33,7 +52,10 @@ DEPLOY_ARGS=(
   --cpu 2
   --memory 2Gi
   --timeout 300
-  --set-env-vars "SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
+  --set-env-vars "${ENV_VARS}"
+  # MCP_ALLOWED_EMAILS comes from Secret Manager. The operator must create
+  # the secret before the first deploy (see header comment).
+  --set-secrets "MCP_ALLOWED_EMAILS=MCP_ALLOWED_EMAILS:latest"
 )
 
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
@@ -44,6 +66,6 @@ echo "Deploying to Cloud Run..."
 gcloud run deploy "${DEPLOY_ARGS[@]}"
 
 echo
-echo "Done. Set the rest of the env (MCP_BEARER_TOKENS, AIRHOST_*, MFA_*, GMAIL_*)"
-echo "via 'gcloud run services update ${SERVICE} --region ${REGION} --update-env-vars ...'"
+echo "Done. Set the rest of the env (AIRHOST_*, MFA_*, GMAIL_*) via:"
+echo "  gcloud run services update ${SERVICE} --region ${REGION} --update-env-vars ..."
 echo "or use Secret Manager via --update-secrets."
