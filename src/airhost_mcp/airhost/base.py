@@ -15,36 +15,84 @@ from pydantic import BaseModel, Field
 ReservationStatus = Literal["confirmed", "cancelled", "blocked", "pending"]
 
 
+# Airhost's data hierarchy is House > RoomType > RoomUnit. We surface the full
+# tree to the MCP client so it can reason about cross-room moves within the
+# same building (e.g. fitting a 1/1-1/3 stay across rooms 101 and 102 when
+# neither has the full window free on its own).
+class RoomUnit(BaseModel):
+    room_unit_id: str
+    room_no: str  # display label, e.g. "101"
+
+
+class RoomType(BaseModel):
+    room_type_id: str
+    name: str
+    occupancy: int | None = None  # max_guests for this room type
+    bedrooms: int | None = None
+    bathrooms: float | None = None
+    nightly_rate_jpy: int | None = None  # min_price
+    cleaning_fee_jpy: int | None = None
+    room_units: list[RoomUnit] = Field(default_factory=list)
+
+
 class Listing(BaseModel):
-    listing_id: str
+    """A House (building). Aggregates one or more RoomTypes."""
+
+    listing_id: str  # = house_id
     name: str
     address: str | None = None
-    bedrooms: int | None = None
-    max_guests: int | None = None
-    nightly_rate_jpy: int | None = None
+    property_type: str | None = None  # e.g. "apartment", "hotel"
     timezone: str = "Asia/Tokyo"
+    checkin_at: str | None = None
+    checkout_at: str | None = None
+    room_types: list[RoomType] = Field(default_factory=list)
+
+
+class RoomTypeAvailability(BaseModel):
+    """Per-RoomType slice of availability on a single date.
+
+    ``total_units`` and ``available_units`` make cross-room moves visible:
+    e.g. for a 3-night stay we can see "101 has 1 free unit on day 1, 103
+    has 1 free unit on day 2, both empty on day 3" and route the guest.
+    """
+
+    room_type_id: str
+    name: str
+    total_units: int
+    available_units: int
+    nightly_rate_jpy: int | None = None
 
 
 class Availability(BaseModel):
-    listing_id: str
+    listing_id: str  # = house_id
     target_date: date
-    available: bool
-    nightly_rate_jpy: int | None = None
+    available: bool  # True iff any room_type has available_units > 0
+    nightly_rate_jpy: int | None = None  # cheapest available room type's rate
     note: str | None = None
+    room_types: list[RoomTypeAvailability] = Field(default_factory=list)
 
 
 class Reservation(BaseModel):
     reservation_id: str
-    listing_id: str
+    listing_id: str  # = house_id
+    # The hierarchy below the building. Set when known (always set when the
+    # data comes from the Airhost booking-calendar API).
+    room_type_id: str | None = None
+    room_unit_id: str | None = None
+    # The channel-side identifier — e.g. Airbnb's "HMxxxx", Booking.com's
+    # numeric ref, jalan's UID. Useful for cross-referencing OTAs.
+    external_uid: str | None = None
     guest_name: str
     check_in: date
     check_out: date
     nights: int
     guests: int = 1
     total_jpy: int | None = None
+    amount_due_jpy: int | None = None  # outstanding balance (booking - paid)
+    payment_status: str | None = None  # e.g. "paid", "balance_due"
     status: ReservationStatus = "confirmed"
-    channel: str | None = None
-    notes: str | None = None
+    channel: str | None = None  # e.g. "Airbnb", "Booking.com", "じゃらん"
+    notes: str | None = None  # populated from block_reason for blocked entries
 
 
 class BlockResult(BaseModel):

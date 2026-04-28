@@ -110,8 +110,20 @@ class GmailMFAStrategy(MFAStrategy):
                     for h in full.get("payload", {}).get("headers", [])
                 }
                 subject = headers.get("subject", "")
-                if not self._subject_re.search(subject):
+                subject_match = self._subject_re.search(subject)
+                if not subject_match:
                     continue
+
+                # If the subject regex itself captured the code (e.g. Airhost:
+                # "ログインコードは 123456 です"), return it directly without
+                # parsing the body. This avoids a second Gmail .get() round-trip
+                # in the common case.
+                if subject_match.groups():
+                    code = subject_match.group(1)
+                    if code:
+                        return code
+
+                # Otherwise fall back to scanning body/snippet/subject.
                 body = self._extract_body(full.get("payload", {}))
                 snippet = full.get("snippet", "")
                 for source in (body, snippet, subject):

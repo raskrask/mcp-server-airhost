@@ -393,3 +393,17 @@ mcp-server-airhost/
 2. `BrowserAirhostClient` が動くまで本番 `AIRHOST_CLIENT=browser` には切り替えない。モックのまま Claude に接続して動作確認するのが先。
 3. Cloud Run + Playwright は **メモリ ≥ 1Gi、min-instances=1** にしないとコールドスタートで Chromium 起動に数秒かかる。常時呼ぶならコスト面で min-instances=1 が現実的。
 4. `Dockerfile` の `mcr.microsoft.com/playwright/python:vX.Y.Z-noble` のタグは `pyproject.toml` の `playwright==` バージョンと合わせる（バージョンずれは起動時に警告 → 失敗の元）。
+
+---
+
+## 未実装 / TODO
+
+優先度順ではなく、**気付いたら拾うリスト**。短くやれそうなものから。
+
+- **Gmail MFA メールの自動整理**: 現状は読み取りのみ（scope `gmail.readonly`）。MFA コード取得後に **既読化 + アーカイブ** する設定 `MFA_AFTER_FETCH=keep|read|archive|trash` を追加したい。実装には scope を `gmail.modify` に昇格 → 既存 `gmail_token.json` の再 consent が必要。デフォルトは `archive`（Inbox から消えるが履歴は残る）が無難。
+- **監査ログ**: 「どのユーザー（email）がどのツールをいつ呼んだか」を構造化ログに残す。OAuth ミドルウェアで `request.state.user_email` を立てているので、`tools.py` で thin wrapper を入れるだけで足りる。
+- **Pub/Sub MFA strategy**: 枠だけ用意（`MFA_STRATEGY=pubsub`）。Gmail forwarder + Zapier or 直接 Pub/Sub push のパイプラインを組んだら有効化。
+- **`block_date` の本実装**: 読み取り系 4 ツールは API 経由で実装済みだが、書き込み系の `block_date` はまだ `NotImplementedError`。Airhost UI でブロックを **作成**したときに走る POST と、**削除**したときに走る DELETE/POST を Network タブで観察し、URL とリクエスト/レスポンスの shape をメモ → 実装する。本物データへの影響を避けるため、テストは遠い未来の空き日（例: 2027-12-31）でやる。
+- **`update_reservation` の本実装**: 同じく未実装。予約画面で日付変更 / ゲスト数変更 / メモ追記 をしたときに走る PATCH/PUT を観察 → 実装。Airbnb / Booking.com 系の予約は OTA 側からの変更しか受け付けない可能性があるので、対応できる項目を最初に整理してから実装。
+- **Cloud Run の min-instances 切替**: 現状 0（コールドスタート許容）。Playwright + Chromium だと初回 5–10 秒待つ。実運用に入ったら min=1 へ（月数千円のコスト増）。
+- **エラー通知 / モニタリング**: Cloud Logging のエラー検知 → メール / Slack 通知。今は無し。
