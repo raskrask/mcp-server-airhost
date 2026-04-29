@@ -60,7 +60,7 @@ def create_app() -> FastAPI:
             "All write operations affect live Airhost state when the browser client "
             "is selected. The server is single-tenant — credentials are server-side."
         ),
-        streamable_http_path="/",
+        streamable_http_path=settings.mcp_mount_path,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -118,7 +118,7 @@ def create_app() -> FastAPI:
             )
         return await call_next(request)
 
-    app.mount(settings.mcp_mount_path, mcp.streamable_http_app())
+    app.mount("/", mcp.streamable_http_app())
 
     return app
 
