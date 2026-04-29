@@ -2,7 +2,7 @@
 
 Airhost 操作用の MCP サーバ。Claude（リモート MCP）から呼び出せる Streamable HTTP transport で公開し、Cloud Run にデプロイして使う想定。
 
-> **現状はモック**。`AIRHOST_CLIENT=mock`（既定）で起動すると、決定論的なダミーデータを返す。Airhost は重い JS の管理コンソールなので、実環境連携は **Playwright（Chromium）でのブラウザ自動化**で行う。スケルトンは `src/airhost_mcp/airhost/browser_client.py` の `BrowserAirhostClient` にあり、ログイン＋MFAフローまで枠組みが入っている。
+Airhost 管理コンソールは重い JS アプリのため、実環境連携は **Playwright（Chromium）でのブラウザ自動化**で行う。`AIRHOST_CLIENT=browser` で実際の Airhost アカウントと接続し、`AIRHOST_CLIENT=mock`（既定）は決定論的なダミーデータを返す。
 
 ---
 
@@ -244,13 +244,15 @@ gsutil iam ch \
 printf 'alice@example.com,bob@example.com' \
   | gcloud secrets create MCP_ALLOWED_EMAILS --data-file=-
 
+echo -n "your-airhost-username" | gcloud secrets create AIRHOST_USERNAME --data-file=-
 echo -n "your-airhost-password" | gcloud secrets create AIRHOST_PASSWORD --data-file=-
 
-# Gmail の token.json（事前にローカルで一度ログイン同意して生成）
-gcloud secrets create GMAIL_TOKEN_JSON --data-file=./gmail_token.json
+# Gmail の credentials.json と token.json（事前にローカルで一度ログイン同意して生成）
+gcloud secrets create GMAIL_CREDENTIALS --data-file=./gmail_credentials.json
+gcloud secrets create GMAIL_TOKEN --data-file=./gmail_token.json
 
 # 各 secret に runner SA の secretAccessor を付与
-for s in MCP_ALLOWED_EMAILS AIRHOST_PASSWORD GMAIL_TOKEN_JSON; do
+for s in MCP_ALLOWED_EMAILS AIRHOST_USERNAME AIRHOST_PASSWORD GMAIL_CREDENTIALS GMAIL_TOKEN; do
   gcloud secrets add-iam-policy-binding "$s" \
     --member=serviceAccount:airhost-mcp-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --role=roles/secretmanager.secretAccessor
@@ -278,11 +280,16 @@ SERVICE_ACCOUNT=airhost-mcp-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com \
 ```bash
 gcloud run services update airhost-mcp \
   --region asia-northeast1 \
-  --update-secrets AIRHOST_PASSWORD=AIRHOST_PASSWORD:latest \
-  --update-env-vars AIRHOST_USERNAME=you@example.com \
-  --update-env-vars AIRHOST_CLIENT=mock \
-  --update-env-vars MFA_STRATEGY=gmail \
-  --update-env-vars MFA_SENDER=no-reply@airhost.co
+  --update-secrets "AIRHOST_USERNAME=AIRHOST_USERNAME:latest" \
+  --update-secrets "AIRHOST_PASSWORD=AIRHOST_PASSWORD:latest" \
+  --update-secrets "MCP_ALLOWED_EMAILS=MCP_ALLOWED_EMAILS:latest" \
+  --set-secrets "/secrets/gmail_credentials.json=GMAIL_CREDENTIALS:latest" \
+  --set-secrets "/secrets/gmail_token.json=GMAIL_TOKEN:latest" \
+  --update-env-vars "AIRHOST_CLIENT=browser" \
+  --update-env-vars "MFA_STRATEGY=gmail" \
+  --update-env-vars "MFA_SENDER=no-reply@airhost.co" \
+  --update-env-vars "GMAIL_CREDENTIALS_PATH=/secrets/gmail_credentials.json" \
+  --update-env-vars "GMAIL_TOKEN_PATH=/secrets/gmail_token.json"
 ```
 
 `--allow-unauthenticated` でデプロイしているのは、claude.ai が GCP IAM を
@@ -367,6 +374,43 @@ gcloud run services update airhost-mcp \
 
 ---
 
+## ローカルMCP単体テスト
+```
+DEV_DISABLE_AUTH=true
+
+curl http://localhost:8080/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": { "name": "Human", "title": "Human Powered Client", "version": "0.0.1" }}}'
+
+
+curl http://localhost:8080/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: SESSION-ID" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/list",
+    "params": {}
+  }'
+
+
+curl http://localhost:8080/mcp/ \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "mcp-session-id: SESSION-ID" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "list_listings",
+      "arguments": {}
+    }
+}'
+```
+
 ## セッション永続化
 
 Cloud Run はインスタンスが頻繁に落ちる前提なので、Airhost のログインセッションを `SessionStore` に書き出して使い回す。Playwright クライアントは `BrowserContext.storage_state()` の戻り値（cookies + 各 origin の localStorage）を JSON 化して保存する。
@@ -413,8 +457,8 @@ mcp-server-airhost/
 
 優先度順ではなく、**気付いたら拾うリスト**。短くやれそうなものから。
 
-- **Gmail MFA メールの自動整理**: 現状は読み取りのみ（scope `gmail.readonly`）。MFA コード取得後に **既読化 + アーカイブ** する設定 `MFA_AFTER_FETCH=keep|read|archive|trash` を追加したい。実装には scope を `gmail.modify` に昇格 → 既存 `gmail_token.json` の再 consent が必要。デフォルトは `archive`（Inbox から消えるが履歴は残る）が無難。
-- **監査ログ**: 「どのユーザー（email）がどのツールをいつ呼んだか」を構造化ログに残す。OAuth ミドルウェアで `request.state.user_email` を立てているので、`tools.py` で thin wrapper を入れるだけで足りる。
+- ~~**Gmail MFA メールの自動整理**~~: ✅ 実装済み。`MFA_AFTER_FETCH=keep|read|archive|trash` で制御。scope は `gmail.modify`。
+- ~~**監査ログ**~~: ✅ 実装済み。`tools.py` の `_audit()` が `AUDIT tool=... user=... ts=...` 形式で INFO ログを出力。
 - **Pub/Sub MFA strategy**: 枠だけ用意（`MFA_STRATEGY=pubsub`）。Gmail forwarder + Zapier or 直接 Pub/Sub push のパイプラインを組んだら有効化。
 - **`block_date` の本実装**: 読み取り系 4 ツールは API 経由で実装済みだが、書き込み系の `block_date` はまだ `NotImplementedError`。Airhost UI でブロックを **作成**したときに走る POST と、**削除**したときに走る DELETE/POST を Network タブで観察し、URL とリクエスト/レスポンスの shape をメモ → 実装する。本物データへの影響を避けるため、テストは遠い未来の空き日（例: 2027-12-31）でやる。
 - **`update_reservation` の本実装**: 同じく未実装。予約画面で日付変更 / ゲスト数変更 / メモ追記 をしたときに走る PATCH/PUT を観察 → 実装。Airbnb / Booking.com 系の予約は OTA 側からの変更しか受け付けない可能性があるので、対応できる項目を最初に整理してから実装。
