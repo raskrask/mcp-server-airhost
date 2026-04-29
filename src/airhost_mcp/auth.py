@@ -136,37 +136,98 @@ def _extract_email(claims: dict[str, Any]) -> tuple[str | None, bool]:
     return (email if isinstance(email, str) and email else None, bool(verified))
 
 
+async def _validate_via_userinfo(
+    request: Request, token: str, settings: Any
+) -> dict[str, Any]:
+    """Validate an opaque (non-JWT) token via Auth0's /userinfo endpoint.
+
+    Auth0 issues opaque access tokens when the authorization request omits the
+    ``audience`` parameter (Claude Code uses RFC 8707 ``resource`` instead).
+    Opaque tokens are still valid bearer credentials that Auth0 accepts at
+    /userinfo, so we use that endpoint to retrieve and verify the user's claims.
+    """
+    domain = settings.auth0_domain
+    url = f"https://{domain}/userinfo"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as http:
+            resp = await http.get(url, headers={"Authorization": f"Bearer {token}"})
+    except Exception as exc:
+        logger.exception("userinfo fetch failed: %s", exc)
+        raise _unauthorized(request, "auth backend unavailable") from exc
+
+    if resp.status_code == 401:
+        raise _unauthorized(request, "invalid token")
+    if resp.status_code != 200:
+        logger.warning("userinfo returned HTTP %s", resp.status_code)
+        raise _unauthorized(request, "auth backend unavailable")
+
+    claims: dict[str, Any] = resp.json()
+    return claims
+
+
 async def verify_oauth_token(request: Request) -> dict[str, Any]:
     """Validate the request's bearer token and enforce the email allowlist.
 
     Returns the verified token claims on success. On any failure raises
     ``HTTPException(401)`` with a populated ``WWW-Authenticate`` header.
+
+    Supports two token formats:
+    - JWT access tokens (issued when Auth0 receives an ``audience`` parameter)
+    - Opaque access tokens (issued when only ``resource`` / no ``audience`` is
+      present, per RFC 8707 / MCP spec) — validated via Auth0's /userinfo.
     """
     settings = get_settings()
 
     header = request.headers.get("authorization", "")
+    logger.info("DEBUG auth: Authorization header present=%s prefix=%r",
+                bool(header), header[:20] if header else "")
     if not header.lower().startswith("bearer "):
         raise _unauthorized(request, "missing bearer token")
     token = header[7:].strip()
     if not token:
         raise _unauthorized(request, "empty bearer token")
 
+    logger.info("DEBUG auth: token length=%d prefix=%r", len(token), token[:20])
+
     if not settings.allowed_email_set:
         logger.error("MCP_ALLOWED_EMAILS is empty; rejecting all requests")
         raise _unauthorized(request, "server allowlist not configured")
+
+    logger.info("DEBUG auth: allowed_emails=%s auth0_domain=%r auth0_audience=%r",
+                settings.allowed_email_set, settings.auth0_domain, settings.auth0_audience)
 
     if not settings.auth0_domain or not settings.auth0_audience:
         logger.error("AUTH0_DOMAIN and AUTH0_AUDIENCE must be set")
         raise _unauthorized(request, "auth backend not configured")
 
     issuer = _issuer(settings)
+    logger.info("DEBUG auth: issuer=%r", issuer)
 
-    # Fetch JWKS and pick the key matching the token's kid header.
+    # Try JWT validation first. If the token header cannot be decoded it is
+    # an opaque token — fall back to /userinfo.
     try:
         unverified_header = jwt.get_unverified_header(token)
+        logger.info("DEBUG auth: JWT header decoded ok: kid=%r alg=%r",
+                    unverified_header.get("kid"), unverified_header.get("alg"))
     except JWTError as exc:
-        logger.info("malformed JWT header: %s", exc)
-        raise _unauthorized(request, "malformed token") from exc
+        logger.info("non-JWT bearer token received, falling back to /userinfo: %s", exc)
+        claims = await _validate_via_userinfo(request, token, settings)
+        logger.info("DEBUG auth: userinfo claims keys=%s", list(claims.keys()))
+        email, verified = _extract_email(claims)
+        if email is None:
+            email = claims.get("email")
+            verified = bool(claims.get("email_verified", False))
+        logger.info("DEBUG auth: userinfo email=%r verified=%s", email, verified)
+        if email is None:
+            raise _unauthorized(request, "token missing email claim")
+        if not verified:
+            raise _unauthorized(request, "email not verified")
+        if email.lower() not in settings.allowed_email_set:
+            logger.info("DEBUG auth: email %r not in allowlist %s", email.lower(), settings.allowed_email_set)
+            raise _unauthorized(request, "email not in allowlist")
+        request.state.user_email = email.lower()
+        logger.info("DEBUG auth: opaque token accepted for %s", email.lower())
+        return claims
 
     kid = unverified_header.get("kid")
     if not kid:
@@ -194,6 +255,7 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
             (k for k in jwks.get("keys", []) if k.get("kid") == kid), None
         )
     if matching_key is None:
+        logger.info("DEBUG auth: no matching signing key for kid=%r", kid)
         raise _unauthorized(request, "no matching signing key")
 
     try:
@@ -204,21 +266,39 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
             audience=settings.auth0_audience,
             issuer=issuer,
         )
+        logger.info("DEBUG auth: JWT decode success, claims keys=%s", list(claims.keys()))
     except JWTError as exc:
-        logger.info("Auth0 JWT rejected: %s", exc)
+        logger.info("Auth0 JWT rejected: %s (audience=%r issuer=%r)", exc, settings.auth0_audience, issuer)
         raise _unauthorized(request, "invalid token") from exc
 
     email, verified = _extract_email(claims)
+    logger.info("DEBUG auth: JWT email=%r verified=%s", email, verified)
+
+    # Auth0 doesn't include email in access tokens by default. Fall back to
+    # /userinfo (which always has email) when the JWT lacks the email claim.
+    if email is None:
+        logger.info("DEBUG auth: no email in JWT, fetching from /userinfo")
+        try:
+            userinfo = await _validate_via_userinfo(request, token, settings)
+            logger.info("DEBUG auth: userinfo keys=%s", list(userinfo.keys()))
+            email = userinfo.get("email")
+            verified = bool(userinfo.get("email_verified", False))
+            logger.info("DEBUG auth: userinfo email=%r verified=%s", email, verified)
+        except HTTPException:
+            raise
+
     if email is None:
         raise _unauthorized(
-            request, "token missing email claim (Auth0 Action required)"
+            request, "token missing email claim (add Auth0 Action or check /userinfo scope)"
         )
     if not verified:
         raise _unauthorized(request, "email not verified")
 
     email_lc = email.lower()
     if email_lc not in settings.allowed_email_set:
+        logger.info("DEBUG auth: email %r not in allowlist %s", email_lc, settings.allowed_email_set)
         raise _unauthorized(request, "email not in allowlist")
 
     request.state.user_email = email_lc
+    logger.info("DEBUG auth: JWT token accepted for %s", email_lc)
     return claims

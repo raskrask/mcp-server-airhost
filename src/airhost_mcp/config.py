@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     # Gmail
     gmail_credentials_path: str = "./gmail_credentials.json"
     gmail_token_path: str = "./gmail_token.json"
+    # What to do with the MFA email after extracting the code.
+    #   keep    — leave in inbox untouched (default for safety)
+    #   read    — mark as read only
+    #   archive — mark read + remove from Inbox label (moves to All Mail)
+    #   trash   — move to Trash
+    # Requires scope gmail.modify for anything other than "keep".
+    mfa_after_fetch: Literal["keep", "read", "archive", "trash"] = "keep"
 
     # Pub/Sub (future)
     pubsub_project_id: str = ""

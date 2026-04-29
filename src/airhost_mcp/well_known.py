@@ -54,13 +54,14 @@ def _resource_url(request: Request) -> str:
     """Compute the canonical resource URL for this MCP server.
 
     Preference order: explicit ``MCP_PUBLIC_URL`` setting → request base URL
-    (works behind Cloud Run's HTTPS terminator). RFC 8707 prefers the form
-    without a trailing slash for interoperability.
+    (works behind Cloud Run's HTTPS terminator). The trailing slash is kept
+    because JavaScript URL normalization (used by MCP clients) always appends
+    one, so the resource field must match the Auth0 API Identifier exactly.
     """
     settings = get_settings()
     if settings.mcp_public_url:
-        return settings.mcp_public_url.rstrip("/")
-    return str(request.base_url).rstrip("/")
+        return settings.mcp_public_url.rstrip("/") + "/"
+    return str(request.base_url)
 
 
 def _hand_written_as_metadata(issuer: str) -> dict[str, Any]:
@@ -129,9 +130,7 @@ def build_router() -> APIRouter:
     """Return a FastAPI router that exposes the OAuth discovery endpoints."""
     router = APIRouter()
 
-    @router.get("/.well-known/oauth-protected-resource")
-    async def protected_resource_metadata(request: Request) -> dict[str, Any]:
-        """RFC 9728 protected-resource metadata for this MCP server."""
+    async def _protected_resource_response(request: Request) -> dict[str, Any]:
         settings = get_settings()
         issuer = _auth0_issuer(settings)
         return {
@@ -141,6 +140,18 @@ def build_router() -> APIRouter:
             "scopes_supported": ["openid", "email", "profile"],
             "resource_documentation": "https://github.com/raskrask/mcp-server-airhost",
         }
+
+    @router.get("/.well-known/oauth-protected-resource")
+    async def protected_resource_metadata(request: Request) -> dict[str, Any]:
+        """RFC 9728 protected-resource metadata for this MCP server."""
+        return await _protected_resource_response(request)
+
+    @router.get("/.well-known/oauth-protected-resource/{path:path}")
+    async def protected_resource_metadata_path(
+        request: Request, path: str
+    ) -> dict[str, Any]:
+        """RFC 9728 path-based discovery variant (e.g. /mcp suffix)."""
+        return await _protected_resource_response(request)
 
     @router.get("/.well-known/oauth-authorization-server")
     async def authorization_server_metadata(request: Request) -> dict[str, Any]:
