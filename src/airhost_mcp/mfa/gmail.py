@@ -18,7 +18,12 @@ from .base import MFAStrategy, MFATimeoutError
 
 logger = logging.getLogger(__name__)
 
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+# gmail.readonly is sufficient for keep/read/archive/trash as long as we use
+# the modify scope for label changes. We request modify unconditionally so
+# the token stays usable even when mfa_after_fetch changes at runtime.
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+AfterFetch = str  # "keep" | "read" | "archive" | "trash"
 
 
 class GmailMFAStrategy(MFAStrategy):
@@ -30,6 +35,7 @@ class GmailMFAStrategy(MFAStrategy):
         sender: str,
         subject_regex: str,
         code_regex: str,
+        after_fetch: AfterFetch = "keep",
         poll_interval: float = 3.0,
     ) -> None:
         self._credentials_path = credentials_path
@@ -37,6 +43,7 @@ class GmailMFAStrategy(MFAStrategy):
         self._sender = sender
         self._subject_re = re.compile(subject_regex, re.IGNORECASE)
         self._code_re = re.compile(code_regex)
+        self._after_fetch = after_fetch
         self._poll_interval = poll_interval
 
     def _get_creds(self) -> Credentials:
@@ -81,6 +88,41 @@ class GmailMFAStrategy(MFAStrategy):
                 return text
         return ""
 
+    async def _after_fetch_action(self, service: object, msg_id: str) -> None:
+        """Apply the configured post-fetch action to the matched MFA email."""
+        if self._after_fetch == "keep":
+            return
+        try:
+            body: dict = {}
+            if self._after_fetch == "read":
+                body = {"removeLabelIds": ["UNREAD"]}
+            elif self._after_fetch == "archive":
+                body = {"removeLabelIds": ["UNREAD", "INBOX"]}
+            elif self._after_fetch == "trash":
+                await asyncio.to_thread(
+                    lambda: service.users()  # type: ignore[union-attr]
+                    .messages()
+                    .trash(userId="me", id=msg_id)
+                    .execute()
+                )
+                logger.debug("gmail mfa: trashed message %s", msg_id)
+                return
+            if body:
+                await asyncio.to_thread(
+                    lambda: service.users()  # type: ignore[union-attr]
+                    .messages()
+                    .modify(userId="me", id=msg_id, body=body)
+                    .execute()
+                )
+                logger.debug(
+                    "gmail mfa: applied after_fetch=%s to message %s",
+                    self._after_fetch,
+                    msg_id,
+                )
+        except Exception as exc:
+            # Never let cleanup failure block the login flow.
+            logger.warning("gmail mfa after-fetch action failed for %s: %s", msg_id, exc)
+
     async def fetch_code(self, *, since_epoch: float, timeout_seconds: int) -> str:
         creds = await asyncio.to_thread(self._get_creds)
         service = await asyncio.to_thread(
@@ -121,14 +163,16 @@ class GmailMFAStrategy(MFAStrategy):
                 if subject_match.groups():
                     code = subject_match.group(1)
                     if code:
+                        await self._after_fetch_action(service, msg_ref["id"])
                         return code
 
                 # Otherwise fall back to scanning body/snippet/subject.
-                body = self._extract_body(full.get("payload", {}))
+                body_text = self._extract_body(full.get("payload", {}))
                 snippet = full.get("snippet", "")
-                for source in (body, snippet, subject):
+                for source in (body_text, snippet, subject):
                     m = self._code_re.search(source)
                     if m:
+                        await self._after_fetch_action(service, msg_ref["id"])
                         return m.group(1) if m.groups() else m.group(0)
             await asyncio.sleep(self._poll_interval)
 

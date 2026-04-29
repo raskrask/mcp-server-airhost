@@ -16,6 +16,7 @@ def build_mfa_strategy(settings: Settings) -> MFAStrategy:
             sender=settings.mfa_sender,
             subject_regex=settings.mfa_subject_regex,
             code_regex=settings.mfa_code_regex,
+            after_fetch=settings.mfa_after_fetch,
         )
     if settings.mfa_strategy == "pubsub":
         from .pubsub import PubSubMFAStrategy
