@@ -34,6 +34,7 @@ def _fake_service(msg_id: str = "msg123") -> MagicMock:
     }
     service.users.return_value.messages.return_value.modify.return_value.execute.return_value = {}
     service.users.return_value.messages.return_value.trash.return_value.execute.return_value = {}
+    service.users.return_value.messages.return_value.delete.return_value.execute.return_value = {}
     return service
 
 
@@ -98,6 +99,28 @@ async def test_trash_calls_trash_endpoint(
         {"messages": [{"id": "msg123"}]},  # list
         svc.users().messages().get().execute(),  # get
         {},           # trash
+    ]
+    mock_time.side_effect = [0.0, 0.0, 0.0, 0.0, 0.0, 999.0]
+
+    code = await strategy.fetch_code(since_epoch=0.0, timeout_seconds=10)
+    assert code == "654321"
+    assert mock_thread.await_count == 5
+
+
+@patch("airhost_mcp.mfa.gmail.asyncio.to_thread", new_callable=AsyncMock)
+@patch("airhost_mcp.mfa.gmail.time.time")
+async def test_delete_calls_delete_endpoint(
+    mock_time: MagicMock, mock_thread: AsyncMock
+) -> None:
+    strategy = _make_strategy("delete")
+    svc = _fake_service()
+
+    mock_thread.side_effect = [
+        MagicMock(),  # get_creds
+        svc,          # build
+        {"messages": [{"id": "msg123"}]},  # list
+        svc.users().messages().get().execute(),  # get
+        {},           # delete
     ]
     mock_time.side_effect = [0.0, 0.0, 0.0, 0.0, 0.0, 999.0]
 

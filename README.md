@@ -460,7 +460,7 @@ mcp-server-airhost/
 
 優先度順ではなく、**気付いたら拾うリスト**。短くやれそうなものから。
 
-- ~~**Gmail MFA メールの自動整理**~~: ✅ 実装済み。`MFA_AFTER_FETCH=keep|read|archive|trash` で制御。scope は `gmail.modify`。
+- ~~**Gmail MFA メールの自動整理**~~: ✅ 実装済み。`MFA_AFTER_FETCH=keep|read|archive|trash|delete` で制御。scope は `gmail.modify`。`delete` は Trash をバイパスして完全削除（復元不可）。
 - ~~**監査ログ**~~: ✅ 実装済み。`tools.py` の `_audit()` が `AUDIT tool=... user=... ts=...` 形式で INFO ログを出力。
 - **Pub/Sub MFA strategy**: 枠だけ用意（`MFA_STRATEGY=pubsub`）。Gmail forwarder + Zapier or 直接 Pub/Sub push のパイプラインを組んだら有効化。
 - **`block_date` の本実装**: 読み取り系 4 ツールは API 経由で実装済みだが、書き込み系の `block_date` はまだ `NotImplementedError`。Airhost UI でブロックを **作成**したときに走る POST と、**削除**したときに走る DELETE/POST を Network タブで観察し、URL とリクエスト/レスポンスの shape をメモ → 実装する。本物データへの影響を避けるため、テストは遠い未来の空き日（例: 2027-12-31）でやる。

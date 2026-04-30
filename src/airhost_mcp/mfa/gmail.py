@@ -93,12 +93,17 @@ class GmailMFAStrategy(MFAStrategy):
         if self._after_fetch == "keep":
             return
         try:
-            body: dict = {}
-            if self._after_fetch == "read":
-                body = {"removeLabelIds": ["UNREAD"]}
-            elif self._after_fetch == "archive":
-                body = {"removeLabelIds": ["UNREAD", "INBOX"]}
-            elif self._after_fetch == "trash":
+            if self._after_fetch == "delete":
+                # Permanently delete — bypasses Trash and is NOT recoverable.
+                await asyncio.to_thread(
+                    lambda: service.users()  # type: ignore[union-attr]
+                    .messages()
+                    .delete(userId="me", id=msg_id)
+                    .execute()
+                )
+                logger.debug("gmail mfa: permanently deleted message %s", msg_id)
+                return
+            if self._after_fetch == "trash":
                 await asyncio.to_thread(
                     lambda: service.users()  # type: ignore[union-attr]
                     .messages()
@@ -107,6 +112,11 @@ class GmailMFAStrategy(MFAStrategy):
                 )
                 logger.debug("gmail mfa: trashed message %s", msg_id)
                 return
+            body: dict = {}
+            if self._after_fetch == "read":
+                body = {"removeLabelIds": ["UNREAD"]}
+            elif self._after_fetch == "archive":
+                body = {"removeLabelIds": ["UNREAD", "INBOX"]}
             if body:
                 await asyncio.to_thread(
                     lambda: service.users()  # type: ignore[union-attr]

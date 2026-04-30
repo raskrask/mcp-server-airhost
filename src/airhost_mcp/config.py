@@ -69,9 +69,10 @@ class Settings(BaseSettings):
     #   keep    — leave in inbox untouched (default for safety)
     #   read    — mark as read only
     #   archive — mark read + remove from Inbox label (moves to All Mail)
-    #   trash   — move to Trash
+    #   trash   — move to Trash (recoverable for ~30 days)
+    #   delete  — permanently delete (NOT recoverable; bypasses Trash)
     # Requires scope gmail.modify for anything other than "keep".
-    mfa_after_fetch: Literal["keep", "read", "archive", "trash"] = "keep"
+    mfa_after_fetch: Literal["keep", "read", "archive", "trash", "delete"] = "keep"
 
     # Pub/Sub (future)
     pubsub_project_id: str = ""
