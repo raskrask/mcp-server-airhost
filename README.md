@@ -32,7 +32,7 @@ FastAPI ──► /health
                 │
                 └─► AirhostClient
                         ├─ MockAirhostClient        (default, deterministic)
-                        └─ BrowserAirhostClient     (Playwright + Chromium, TBD)
+                        └─ BrowserAirhostClient     (Playwright + Chromium)
                               │
                               ├─ SessionStore       (local | GCS) — stores Playwright storage_state
                               └─ MFAStrategy        (gmail | pubsub | manual)
@@ -287,7 +287,7 @@ gcloud run services update airhost-mcp \
   --set-secrets "/secrets/gmail_token.json=GMAIL_TOKEN:latest" \
   --update-env-vars "AIRHOST_CLIENT=browser" \
   --update-env-vars "MFA_STRATEGY=gmail" \
-  --update-env-vars "MFA_SENDER=no-reply@airhost.co" \
+  --update-env-vars "MFA_SENDER=noreply@airhost.co" \
   --update-env-vars "GMAIL_CREDENTIALS_PATH=/secrets/gmail_credentials.json" \
   --update-env-vars "GMAIL_TOKEN_PATH=/secrets/gmail_token.json"
 ```
@@ -435,7 +435,10 @@ mcp-server-airhost/
 │   ├── airhost/             # AirhostClient + Mock + Browser(Playwright, TBD)
 │   ├── mfa/                 # MFAStrategy (gmail / pubsub / manual)
 │   └── session/             # SessionStore (local / gcs)
-├── scripts/deploy_cloudrun.sh
+├── scripts/
+│   ├── deploy_cloudrun.sh
+│   ├── login_smoke.py       # ログイン〜MFA フローのスモークテスト
+│   └── tools_smoke.py       # 各 MCP ツールを直接叩くスモークテスト
 ├── tests/
 ├── Dockerfile
 ├── pyproject.toml
