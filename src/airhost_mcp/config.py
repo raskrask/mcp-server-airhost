@@ -72,7 +72,7 @@ class Settings(BaseSettings):
     #   trash   — move to Trash (recoverable for ~30 days)
     #   delete  — permanently delete (NOT recoverable; bypasses Trash)
     # Requires scope gmail.modify for anything other than "keep".
-    mfa_after_fetch: Literal["keep", "read", "archive", "trash", "delete"] = "keep"
+    mfa_after_fetch: Literal["keep", "read", "archive", "trash", "delete"] = "trash"
 
     # Pub/Sub (future)
     pubsub_project_id: str = ""
