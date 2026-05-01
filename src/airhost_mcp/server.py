@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 
 from .airhost import build_airhost_client
 from .auth import verify_oauth_token
@@ -37,6 +37,10 @@ def _is_well_known_path(path: str) -> bool:
 
 def _is_health_path(path: str) -> bool:
     return path == "/health"
+
+
+def _is_oidc_register_path(path: str) -> bool:
+    return path == "/oidc/register"
 
 
 # Cached result of the DCR availability probe performed at startup.
@@ -142,6 +146,36 @@ def create_app() -> FastAPI:
             }
         return {"status": "ok"}
 
+    # DCR proxy: when AUTH0_CLIENT_ID is set, return the pre-registered client_id
+    # instead of forwarding Dynamic Client Registration to Auth0. This prevents a
+    # new Auth0 application from being created on every MCP client connection.
+    # The well_known router points registration_endpoint here when enabled.
+    @app.post("/oidc/register")
+    async def oidc_register(request: Request) -> Response:
+        settings = get_settings()
+        if not settings.auth0_client_id:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"error": "not_supported"}, status_code=404)
+
+        body: dict = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {
+                "client_id": settings.auth0_client_id,
+                "client_name": body.get("client_name", "airhost-mcp-client"),
+                "redirect_uris": body.get("redirect_uris", []),
+                "grant_types": body.get("grant_types", ["authorization_code"]),
+                "response_types": body.get("response_types", ["code"]),
+                "token_endpoint_auth_method": "none",
+            },
+            status_code=201,
+        )
+
     # OAuth discovery: /.well-known/oauth-protected-resource +
     # /.well-known/oauth-authorization-server. Mounted on the FastAPI app
     # itself so they sit at the public origin root, not under /mcp.
@@ -155,7 +189,7 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def oauth_gate(request, call_next):
         path = request.url.path
-        if _is_health_path(path) or _is_well_known_path(path):
+        if _is_health_path(path) or _is_well_known_path(path) or _is_oidc_register_path(path):
             return await call_next(request)
 
         current = get_settings()

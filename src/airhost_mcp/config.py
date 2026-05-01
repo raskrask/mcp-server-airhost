@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     # Comma-separated allowlist of authorized email addresses. Compared
     # case-insensitively against the verified ``email`` claim.
     mcp_allowed_emails: str = ""
+    # Pre-registered Auth0 application client_id. When set, the server exposes
+    # a /oidc/register endpoint that always returns this fixed client_id instead
+    # of forwarding DCR to Auth0. Prevents new Auth0 apps from being created on
+    # every new MCP client connection (avoids "too_many_entities" quota errors).
+    # Create one Auth0 Native app manually and paste its client_id here.
+    auth0_client_id: str = ""
     # Public origin (and optional path) of this MCP server, used in OAuth
     # protected-resource metadata. If empty, derived from the first incoming
     # request's ``base_url`` and cached.

@@ -159,13 +159,20 @@ def build_router() -> APIRouter:
 
     @router.get("/.well-known/oauth-authorization-server")
     async def authorization_server_metadata(request: Request) -> dict[str, Any]:
-        """RFC 8414 metadata, proxied + cached from Auth0."""
+        """RFC 8414 metadata, proxied + cached from Auth0.
+
+        When AUTH0_CLIENT_ID is set, ``registration_endpoint`` is overridden to
+        point at this server's /oidc/register proxy so clients always receive
+        the pre-registered client_id instead of creating a new Auth0 app.
+        """
         settings = get_settings()
         issuer = _auth0_issuer(settings)
         if not issuer:
-            # No Auth0 configured — return a placeholder fallback so discovery
-            # doesn't 500 in local dev.
             return _hand_written_as_metadata("https://unconfigured.auth0.invalid/")
-        return await _fetch_auth0_openid_configuration(issuer)
+        metadata = dict(await _fetch_auth0_openid_configuration(issuer))
+        if settings.auth0_client_id:
+            base = _resource_url(request).rstrip("/")
+            metadata["registration_endpoint"] = f"{base}/oidc/register"
+        return metadata
 
     return router

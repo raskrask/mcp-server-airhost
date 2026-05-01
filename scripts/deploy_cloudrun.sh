@@ -37,7 +37,7 @@ MCP_PUBLIC_URL="${MCP_PUBLIC_URL:-}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 AUTH0_MGMT_CLIENT_ID="${AUTH0_MGMT_CLIENT_ID:-}"
 AUTH0_MGMT_CLIENT_SECRET="${AUTH0_MGMT_CLIENT_SECRET:-}"
-AUTH0_MGMT_KEEP_APPS="${AUTH0_MGMT_KEEP_APPS:-5}"
+AUTH0_MGMT_KEEP_APPS="${AUTH0_MGMT_KEEP_APPS:-2}"
 
 # ---------------------------------------------------------------------------
 # cleanup_auth0_dcr_apps: delete stale DCR-registered OAuth clients from Auth0.
@@ -75,22 +75,6 @@ cleanup_auth0_dcr_apps() {
 
   # Find DCR-like clients and collect IDs to delete (oldest first, keep N most recent).
   local to_delete
-  to_delete=$(echo "${clients_json}" | python3 - <<'PYEOF'
-import json, sys
-clients = json.load(sys.stdin)
-dcr = [
-    c for c in clients
-    if c.get("token_endpoint_auth_method") == "none"
-    and "authorization_code" in c.get("grant_types", [])
-    and not c.get("is_first_party", True)
-]
-dcr.sort(key=lambda c: c.get("created_at", ""), reverse=True)
-keep = int("KEEP_PLACEHOLDER")
-for c in dcr[keep:]:
-    print(c["client_id"], c.get("name", ""))
-PYEOF
-)
-  # Replace placeholder with actual keep value
   to_delete=$(echo "${clients_json}" | python3 -c "
 import json, sys
 clients = json.load(sys.stdin)
