@@ -35,14 +35,28 @@ gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "$
 
 # Playwright + Chromium needs significantly more memory and CPU than a plain
 # Python service. 2Gi / 2 vCPU is a safe starting point; tune down later.
+# Gmail credential files are mounted from Secret Manager as separate file paths.
+# gcloud run only allows one secret per directory, so each gets its own dir.
+GMAIL_CREDS_PATH="/secrets/gmail-credentials/credentials.json"
+GMAIL_TOKEN_PATH="/secrets/gmail-token/token.json"
+
 ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
 ENV_VARS+=",AUTH0_DOMAIN=${AUTH0_DOMAIN},AUTH0_AUDIENCE=${AUTH0_AUDIENCE}"
+ENV_VARS+=",AIRHOST_CLIENT=browser,MFA_STRATEGY=gmail"
+ENV_VARS+=",GMAIL_CREDENTIALS_PATH=${GMAIL_CREDS_PATH},GMAIL_TOKEN_PATH=${GMAIL_TOKEN_PATH}"
 if [[ -n "${AUTH0_ISSUER}" ]]; then
   ENV_VARS+=",AUTH0_ISSUER=${AUTH0_ISSUER}"
 fi
 if [[ -n "${MCP_PUBLIC_URL}" ]]; then
   ENV_VARS+=",MCP_PUBLIC_URL=${MCP_PUBLIC_URL}"
 fi
+
+# Secrets wired as env vars (credentials) and file mounts (gmail JSON files).
+SECRETS="MCP_ALLOWED_EMAILS=MCP_ALLOWED_EMAILS:latest"
+SECRETS+=",AIRHOST_USERNAME=AIRHOST_USERNAME:latest"
+SECRETS+=",AIRHOST_PASSWORD=AIRHOST_PASSWORD:latest"
+SECRETS+=",${GMAIL_CREDS_PATH}=GMAIL_CREDENTIALS:latest"
+SECRETS+=",${GMAIL_TOKEN_PATH}=GMAIL_TOKEN:latest"
 
 DEPLOY_ARGS=(
   "${SERVICE}"
@@ -59,9 +73,7 @@ DEPLOY_ARGS=(
   --memory 2Gi
   --timeout 300
   --set-env-vars "${ENV_VARS}"
-  # MCP_ALLOWED_EMAILS comes from Secret Manager. The operator must create
-  # the secret before the first deploy (see header comment).
-  --set-secrets "MCP_ALLOWED_EMAILS=MCP_ALLOWED_EMAILS:latest"
+  --set-secrets "${SECRETS}"
 )
 
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
