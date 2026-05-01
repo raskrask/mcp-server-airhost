@@ -16,8 +16,12 @@ more stable than HTML scraping and avoids the React rerender timing fights.
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
+import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, AsyncIterator
@@ -171,6 +175,17 @@ class BrowserAirhostClient(AirhostClient):
     @asynccontextmanager
     async def _page(self) -> AsyncIterator[Page]:
         """Yield a logged-in page. Reuses persisted storage_state when fresh."""
+        async with self._page_and_context() as (page, _context):
+            yield page
+
+    @asynccontextmanager
+    async def _page_and_context(self) -> AsyncIterator[tuple[Page, BrowserContext]]:
+        """Yield (page, context) for callers that also need the BrowserContext.
+
+        ``_page()`` is a thin wrapper over this. Most methods only need the
+        page; ``_fetch_ota_commissions`` also needs the context so it can read
+        the live cookie jar for the ActionCable WebSocket handshake.
+        """
         browser = await self._ensure_browser()
         record = await self._session_store.load(self._username)
         storage_state: dict[str, Any] | None = None
@@ -182,7 +197,7 @@ class BrowserAirhostClient(AirhostClient):
             page = await context.new_page()
             if storage_state is None:
                 await self._login(page, context)
-            yield page
+            yield page, context
             # Save updated storage_state on successful exit.
             await self._persist_session(context)
         finally:
@@ -434,14 +449,17 @@ class BrowserAirhostClient(AirhostClient):
         occupies the date — that matches Airhost's own checkout-by-morning
         semantics (a 5/3→5/4 booking only occupies 5/3).
         """
-        async with self._page() as page:
+        async with self._page_and_context() as (page, context):
             bookings = await self._fetch_bookings(
                 page, house_id=listing_id, start_date=target_date, end_date=target_date
             )
             occupying = [
                 b for b in bookings if b.check_in <= target_date < b.check_out
             ]
-            await self._enrich_with_invoice(page, occupying)
+            commissions = await self._fetch_ota_commissions(
+                context, page, target_date, target_date
+            )
+            await self._enrich_with_invoice(page, occupying, ota_commissions=commissions)
             return occupying
 
     async def block_date(
@@ -467,7 +485,7 @@ class BrowserAirhostClient(AirhostClient):
         Airhost's calendar endpoint requires a house_id, so when listing_id
         is None we fan out across all houses the account manages and merge.
         """
-        async with self._page() as page:
+        async with self._page_and_context() as (page, context):
             if listing_id is not None:
                 house_ids = [listing_id]
             else:
@@ -489,7 +507,11 @@ class BrowserAirhostClient(AirhostClient):
                     logger.warning("bookings fetch failed for house %s: %s", hid, res)
                     continue
                 out.extend(res)
-            await self._enrich_with_invoice(page, out)
+            # Fetch OTA commission data from CSV export (concurrent with invoice detail).
+            commissions = await self._fetch_ota_commissions(
+                context, page, start_date, end_date
+            )
+            await self._enrich_with_invoice(page, out, ota_commissions=commissions)
             return out
 
     # ----- internal helpers shared by the read tools -----
@@ -633,10 +655,221 @@ class BrowserAirhostClient(AirhostClient):
             return None
         return payload.get("data") or {}
 
+    async def _fetch_ota_commissions(
+        self,
+        context: BrowserContext,
+        page: Page,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, int]:
+        """Fetch OTA commission (手数料) for all bookings in [start_date, end_date].
+
+        Airhost's per-booking REST APIs do not expose OTA commission. The only
+        machine-readable source is the async CSV export delivered over
+        ActionCable (MessageQueueChannel). This method:
+
+          1. Opens an ActionCable WebSocket using the current browser session's
+             cookies (extracted from the Playwright context).
+          2. Subscribes to the MessageQueueChannel and to the specific export
+             job's result topic.
+          3. Triggers ``POST /pms/bookings/export`` for the requested range.
+          4. Waits for the download URL and fetches the CSV.
+          5. Returns a dict mapping ``uid`` (= ``external_uid`` /
+             ``チャンネル予約ID``) → commission in JPY.
+
+        On any failure the method logs a warning and returns an empty dict so
+        the rest of the enrichment is unaffected.
+        """
+        try:
+            import websockets  # type: ignore[import-untyped]
+            import httpx
+        except ImportError:
+            logger.warning("ota_commission unavailable: install websockets and httpx")
+            return {}
+
+        _CABLE_URL = "wss://api2.airhost.co/cable"
+
+        # Extract cookie header from the live Playwright context
+        try:
+            raw_cookies = await context.cookies()
+            cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in raw_cookies)
+            cookie_dict = {c["name"]: c["value"] for c in raw_cookies}
+        except Exception as exc:
+            logger.warning("ota_commission: could not read cookies: %s", exc)
+            return {}
+
+        nonce = str(uuid.uuid4())
+        identifier = json.dumps({"channel": "MessageQueueChannel", "nonce": nonce})
+        ws_headers = {"Cookie": cookie_header, "Origin": "https://pms.airhost.co"}
+
+        download_url: str | None = None
+
+        try:
+            async with websockets.connect(
+                _CABLE_URL,
+                additional_headers=ws_headers,
+                open_timeout=15,
+            ) as ws:
+                # Welcome
+                welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if welcome.get("type") != "welcome":
+                    logger.warning("ota_commission: unexpected WS welcome: %s", welcome)
+                    return {}
+
+                # Subscribe to MessageQueueChannel
+                await ws.send(json.dumps({"command": "subscribe", "identifier": identifier}))
+                for _ in range(10):
+                    msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                    if msg.get("type") == "confirm_subscription":
+                        break
+                    if msg.get("type") == "reject_subscription":
+                        logger.warning("ota_commission: WS subscription rejected")
+                        return {}
+                    if msg.get("type") == "ping":
+                        continue
+                else:
+                    logger.warning("ota_commission: no confirm_subscription received")
+                    return {}
+
+                # Subscribe to account notifications (keeps the channel alive)
+                tenant = await self._ensure_tenant_id(page)
+                await ws.send(json.dumps({
+                    "command": "message",
+                    "identifier": identifier,
+                    "data": json.dumps({
+                        "topic": f"/accounts/{tenant}/notifications",
+                        "afterSid": "0",
+                        "action": "subscribe_topic",
+                    }),
+                }))
+
+                # Trigger CSV export
+                export_body = {
+                    "date_range": {
+                        "start_date": start_date.isoformat(),
+                        "end_date": end_date.isoformat(),
+                    },
+                    "date_type": "checkin_date",
+                    "status": [],
+                }
+                headers = await self._build_headers(page)
+                export_url = f"{self._API_BASE}/pms/bookings/export?locale=ja"
+                resp = await page.request.post(export_url, data=export_body, headers=headers)
+                if resp.status == 401:
+                    err_body = await resp.json()
+                    new_csrf = (err_body.get("data") or {}).get("csrf_token")
+                    if new_csrf:
+                        self._csrf_token = new_csrf
+                        headers = await self._build_headers(page)
+                        resp = await page.request.post(export_url, data=export_body, headers=headers)
+                if resp.status == 429:
+                    # Rate-limited: wait and retry once
+                    wait_sec = 35
+                    try:
+                        rb = await resp.json()
+                        wait_sec = (rb.get("data") or {}).get("lck_seconds", 35) + 2
+                    except Exception:
+                        pass
+                    logger.info("ota_commission: export rate-limited, waiting %ss", wait_sec)
+                    await asyncio.sleep(wait_sec)
+                    resp = await page.request.post(export_url, data=export_body, headers=headers)
+
+                if not resp.ok:
+                    logger.warning("ota_commission: export POST returned HTTP %s", resp.status)
+                    return {}
+
+                resp_body = await resp.json()
+                topic = resp_body.get("topic") or (resp_body.get("data") or {}).get("topic") or ""
+                parts = [p for p in topic.split("/") if p]
+                job_id = parts[1] if len(parts) >= 2 else None
+                if not job_id:
+                    logger.warning("ota_commission: could not parse job_id from %r", topic)
+                    return {}
+
+                # Subscribe to the specific job result topic
+                await ws.send(json.dumps({
+                    "command": "message",
+                    "identifier": identifier,
+                    "data": json.dumps({
+                        "topic": f"/airhost_booking_export_jobs/{job_id}/result",
+                        "afterSid": "0",
+                        "action": "subscribe_topic",
+                    }),
+                }))
+
+                # Wait for the result message (up to 90s)
+                deadline = asyncio.get_event_loop().time() + 90
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        raw_msg = await asyncio.wait_for(ws.recv(), timeout=5)
+                        msg = json.loads(raw_msg)
+                        if msg.get("type") == "ping":
+                            continue
+                        # Navigate the nested structure:
+                        # message.records[].body → JSON → object.files[].url
+                        msg_data = msg.get("message") or {}
+                        for record in (msg_data.get("records") or []):
+                            body = record.get("body") or ""
+                            if isinstance(body, str):
+                                body = json.loads(body)
+                            obj = body.get("object") or {}
+                            for f in (obj.get("files") or []):
+                                u = f.get("url")
+                                if u:
+                                    download_url = u
+                                    break
+                            if download_url:
+                                break
+                        if download_url:
+                            break
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as exc:
+                        logger.warning("ota_commission: WS recv error: %s", exc)
+                        break
+        except Exception as exc:
+            logger.warning("ota_commission: ActionCable error: %s", exc)
+            return {}
+
+        if not download_url:
+            logger.warning("ota_commission: no download URL received within 90s")
+            return {}
+
+        # Download and parse CSV
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, cookies=cookie_dict, timeout=30
+            ) as http:
+                dl = await http.get(download_url)
+            csv_text = dl.content.decode("utf-8-sig", errors="replace")
+            reader = csv.DictReader(io.StringIO(csv_text))
+            result: dict[str, int] = {}
+            for row in reader:
+                uid = (row.get("チャンネル予約ID") or "").strip()
+                commission_str = (row.get("OTA サービス料") or "").strip()
+                if uid and commission_str:
+                    try:
+                        result[uid] = int(float(commission_str))
+                    except (ValueError, TypeError):
+                        pass
+            logger.info("ota_commission: loaded %d entries from CSV", len(result))
+            return result
+        except Exception as exc:
+            logger.warning("ota_commission: CSV download/parse failed: %s", exc)
+            return {}
+
     async def _enrich_with_invoice(
-        self, page: Page, reservations: list[Reservation]
+        self,
+        page: Page,
+        reservations: list[Reservation],
+        *,
+        ota_commissions: dict[str, int] | None = None,
     ) -> None:
-        """Populate total_jpy / amount_due_jpy / payment_status in-place.
+        """Populate total_jpy / amount_due_jpy / payment_status / rate_plan_name in-place.
+
+        ``ota_commissions`` is an optional pre-fetched uid → commission dict
+        (from ``_fetch_ota_commissions``). When provided, ``ota_commission_jpy``
+        is populated for any reservation whose ``external_uid`` is in the map.
 
         Skips blocks (no invoice). Fetches details concurrently with a
         small semaphore so a 60-day range across many rooms doesn't open
@@ -670,6 +903,11 @@ class BrowserAirhostClient(AirhostClient):
             # rate_plan_name lives directly on the booking detail object.
             if not r.rate_plan_name:
                 r.rate_plan_name = data.get("rate_plan_name") or None
+            # OTA commission from the pre-fetched CSV map (keyed by external uid).
+            if ota_commissions is not None and r.external_uid:
+                commission = ota_commissions.get(r.external_uid)
+                if commission is not None:
+                    r.ota_commission_jpy = commission
 
         await asyncio.gather(*[one(r) for r in targets], return_exceptions=True)
 
