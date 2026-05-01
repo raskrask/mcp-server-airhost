@@ -83,7 +83,7 @@ def _hand_written_as_metadata(issuer: str) -> dict[str, Any]:
         "response_types_supported": ["code", "token", "id_token"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "id_token_signing_alg_values_supported": ["RS256"],
-        "scopes_supported": ["openid", "email", "profile"],
+        "scopes_supported": ["openid", "email", "profile", "offline_access"],
         "token_endpoint_auth_methods_supported": [
             "client_secret_post",
             "client_secret_basic",
@@ -137,7 +137,11 @@ def build_router() -> APIRouter:
             "resource": _resource_url(request),
             "authorization_servers": [issuer] if issuer else [],
             "bearer_methods_supported": ["header"],
-            "scopes_supported": ["openid", "email", "profile"],
+            # offline_access is required so MCP clients request a refresh_token.
+            # Without it, clients omit offline_access from their scope request,
+            # Auth0 issues no refresh_token, and the connection dies when the
+            # 24-hour access_token expires.
+            "scopes_supported": ["openid", "email", "profile", "offline_access"],
             "resource_documentation": "https://github.com/raskrask/mcp-server-airhost",
         }
 

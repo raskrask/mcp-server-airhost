@@ -83,7 +83,7 @@ class Settings(BaseSettings):
     session_local_dir: str = "./.sessions"
     session_gcs_bucket: str = ""
     session_gcs_prefix: str = "airhost-mcp/sessions/"
-    session_ttl_seconds: int = 3600
+    session_ttl_seconds: int = 86400  # 24 h; Airhost sessions survive overnight
 
     log_level: str = "INFO"
 

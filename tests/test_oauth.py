@@ -195,18 +195,21 @@ async def test_verify_signature_rejected(
     assert getattr(ei.value, "status_code", None) == 401
 
 
+@patch("airhost_mcp.auth._validate_via_userinfo", new_callable=AsyncMock)
 @patch("airhost_mcp.auth._fetch_jwks", new_callable=AsyncMock)
 @patch("airhost_mcp.auth.jwt.decode")
 @patch("airhost_mcp.auth.jwt.get_unverified_header")
 async def test_verify_missing_email_claim(
-    mock_get_header, mock_decode, mock_jwks
+    mock_get_header, mock_decode, mock_jwks, mock_userinfo
 ) -> None:
     mock_get_header.return_value = {"kid": "test-kid-1"}
     mock_jwks.return_value = _fake_jwks()
     mock_decode.return_value = {
         "sub": "google-oauth2|999",
-        # no email at all
+        # no email in JWT — code falls back to /userinfo
     }
+    # /userinfo also returns no email → should raise "token missing email claim"
+    mock_userinfo.return_value = {"sub": "google-oauth2|999"}
     with pytest.raises(Exception) as ei:
         await auth_mod.verify_oauth_token(_build_request("tok"))
     assert getattr(ei.value, "status_code", None) == 401
@@ -260,7 +263,7 @@ async def test_protected_resource_metadata_shape() -> None:
         resp = await c.get("/.well-known/oauth-protected-resource")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["resource"] == "https://mcp.example.com"
+    assert body["resource"] == "https://mcp.example.com/"
     assert body["authorization_servers"] == ["https://tenant.jp.auth0.com/"]
     assert body["bearer_methods_supported"] == ["header"]
 
@@ -351,7 +354,7 @@ async def test_well_known_is_public_via_full_app(monkeypatch: pytest.MonkeyPatch
         resp = await c.get("/.well-known/oauth-protected-resource")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["resource"] == "https://mcp.example.com"
+    assert body["resource"] == "https://mcp.example.com/"
 
 
 async def test_mcp_request_without_token_returns_401(monkeypatch: pytest.MonkeyPatch) -> None:

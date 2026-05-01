@@ -55,7 +55,13 @@ class GmailMFAStrategy(MFAStrategy):
             return creds
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            token_file.write_text(creds.to_json(), encoding="utf-8")
+            try:
+                token_file.write_text(creds.to_json(), encoding="utf-8")
+            except OSError as exc:
+                # Secret Manager volume mounts are read-only; writeback failure
+                # is non-fatal — the in-memory creds are still valid and the
+                # next startup will re-refresh from the same refresh_token.
+                logger.warning("gmail token writeback failed (read-only mount?): %s", exc)
             return creds
         # First-time consent flow. Local only — Cloud Run should ship a pre-built token.
         flow = InstalledAppFlow.from_client_secrets_file(
