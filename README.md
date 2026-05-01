@@ -266,7 +266,7 @@ done
 ```bash
 PROJECT_ID=YOUR_PROJECT_ID \
 REGION=asia-northeast1 \
-SESSION_BUCKET=airhost-mcp-sessions-YOURUNIQ \
+SESSION_GCS_BUCKET=airhost-mcp-sessions-YOURUNIQ \
 AUTH0_DOMAIN=tenant.jp.auth0.com \
 AUTH0_AUDIENCE=https://airhost-mcp.example.com \
 MCP_PUBLIC_URL=https://airhost-mcp-XXXXX.asia-northeast1.run.app \

@@ -20,7 +20,7 @@ set -euo pipefail
 : "${PROJECT_ID:?PROJECT_ID env var required}"
 REGION="${REGION:-asia-northeast1}"
 SERVICE="${SERVICE:-airhost-mcp}"
-SESSION_BUCKET="${SESSION_BUCKET:?SESSION_BUCKET env var required (existing GCS bucket name)}"
+SESSION_GCS_BUCKET="${SESSION_GCS_BUCKET:?SESSION_GCS_BUCKET env var required (existing GCS bucket name)}"
 AUTH0_DOMAIN="${AUTH0_DOMAIN:?AUTH0_DOMAIN env var required (e.g. tenant.region.auth0.com)}"
 AUTH0_AUDIENCE="${AUTH0_AUDIENCE:?AUTH0_AUDIENCE env var required (Auth0 API identifier)}"
 AUTH0_CLIENT_ID="${AUTH0_CLIENT_ID:?AUTH0_CLIENT_ID env var required (pre-registered Auth0 Native app client_id)}"
@@ -38,7 +38,7 @@ gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "$
 GMAIL_CREDS_PATH="/secrets/gmail-credentials/credentials.json"
 GMAIL_TOKEN_PATH="/secrets/gmail-token/token.json"
 
-ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_BUCKET},BROWSER_HEADLESS=true"
+ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_GCS_BUCKET},BROWSER_HEADLESS=true"
 ENV_VARS+=",AUTH0_DOMAIN=${AUTH0_DOMAIN},AUTH0_AUDIENCE=${AUTH0_AUDIENCE},AUTH0_CLIENT_ID=${AUTH0_CLIENT_ID}"
 ENV_VARS+=",AIRHOST_CLIENT=browser,MFA_STRATEGY=gmail"
 ENV_VARS+=",GMAIL_CREDENTIALS_PATH=${GMAIL_CREDS_PATH},GMAIL_TOKEN_PATH=${GMAIL_TOKEN_PATH}"
