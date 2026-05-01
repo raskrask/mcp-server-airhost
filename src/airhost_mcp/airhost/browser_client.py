@@ -667,6 +667,9 @@ class BrowserAirhostClient(AirhostClient):
                 except (TypeError, ValueError):
                     pass
             r.payment_status = summary.get("payment_status") or r.payment_status
+            # rate_plan_name lives directly on the booking detail object.
+            if not r.rate_plan_name:
+                r.rate_plan_name = data.get("rate_plan_name") or None
 
         await asyncio.gather(*[one(r) for r in targets], return_exceptions=True)
 

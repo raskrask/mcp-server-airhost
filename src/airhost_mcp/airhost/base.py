@@ -90,6 +90,8 @@ class Reservation(BaseModel):
     total_jpy: int | None = None
     amount_due_jpy: int | None = None  # outstanding balance (booking - paid)
     payment_status: str | None = None  # e.g. "paid", "balance_due"
+    rate_plan_name: str | None = None  # e.g. "素泊まりプラン", "朝食付きプラン"
+    ota_commission_jpy: int | None = None  # OTA commission fee (手数料) in JPY
     status: ReservationStatus = "confirmed"
     channel: str | None = None  # e.g. "Airbnb", "Booking.com", "じゃらん"
     notes: str | None = None  # populated from block_reason for blocked entries
