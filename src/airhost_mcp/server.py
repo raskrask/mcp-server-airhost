@@ -15,10 +15,12 @@ Or via the console script::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
 
+import httpx
 import uvicorn
 from fastapi import FastAPI
 
@@ -35,6 +37,57 @@ def _is_well_known_path(path: str) -> bool:
 
 def _is_health_path(path: str) -> bool:
     return path == "/health"
+
+
+# Cached result of the DCR availability probe performed at startup.
+# None = not yet checked, True = available, False = limit reached.
+_dcr_available: bool | None = None
+
+
+async def _probe_dcr_availability() -> None:
+    """Probe Auth0 DCR at startup and log CRITICAL if the entity limit is hit.
+
+    Sends a purposely incomplete registration request (missing required fields).
+    Auth0 evaluates the entity quota *before* validating required fields, so:
+      - quota exhausted  → 403 {"errorCode": "too_many_entities"}
+      - quota OK         → 400/422 validation error (no client created)
+
+    The result is cached in ``_dcr_available`` and surfaced by ``/health``.
+    """
+    global _dcr_available
+
+    settings = get_settings()
+    if not settings.auth0_domain:
+        return
+
+    url = f"https://{settings.auth0_domain}/oidc/register"
+    # Intentionally omit required fields — we only want the quota check.
+    probe = {"code_challenge_method": "S256"}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.post(url, json=probe)
+    except Exception as exc:
+        logger.warning("DCR probe request failed: %s", exc)
+        return
+
+    if resp.status_code == 403:
+        data: dict = {}
+        try:
+            data = resp.json()
+        except Exception:
+            pass
+        if data.get("errorCode") == "too_many_entities":
+            _dcr_available = False
+            logger.critical(
+                "AUTH0 DCR LIMIT REACHED (too_many_entities): new MCP clients cannot "
+                "complete OAuth. Delete unused applications at https://manage.auth0.com/ "
+                "or run the deploy script with AUTH0_MGMT_CLIENT_ID/SECRET to auto-clean."
+            )
+            return
+
+    # Any other response (400/422 validation error) means the quota is fine.
+    _dcr_available = True
+    logger.info("DCR probe: Auth0 client registration is available")
 
 
 def create_app() -> FastAPI:
@@ -72,6 +125,8 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async with mcp.session_manager.run():
+            # Probe DCR in the background — don't delay startup.
+            asyncio.create_task(_probe_dcr_availability())
             yield
 
     app = FastAPI(title="airhost-mcp", version="0.1.0", lifespan=lifespan)
@@ -80,6 +135,11 @@ def create_app() -> FastAPI:
     # (it 404s before reaching the container). Use "/health" instead.
     @app.get("/health")
     async def health() -> dict[str, str]:
+        if _dcr_available is False:
+            return {
+                "status": "degraded",
+                "reason": "Auth0 DCR limit reached — new clients cannot authenticate",
+            }
         return {"status": "ok"}
 
     # OAuth discovery: /.well-known/oauth-protected-resource +

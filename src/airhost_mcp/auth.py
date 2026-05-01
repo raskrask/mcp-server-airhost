@@ -99,25 +99,31 @@ async def _fetch_jwks(domain: str) -> dict[str, Any]:
         return data
 
 
-def _challenge_header(request: Request) -> dict[str, str]:
-    """Build the RFC 6750 / RFC 9728 ``WWW-Authenticate`` challenge."""
+def _challenge_header(request: Request, error_code: str | None = None) -> dict[str, str]:
+    """Build the RFC 6750 / RFC 9728 ``WWW-Authenticate`` challenge.
+
+    Per RFC 6750 §3.1, ``error`` MUST NOT be included when no token was
+    provided — only include it when a token was present but invalid.
+    """
     settings = get_settings()
     base = settings.mcp_public_url or str(request.base_url).rstrip("/")
     metadata_url = f"{base.rstrip('/')}/.well-known/oauth-protected-resource"
-    return {
-        "WWW-Authenticate": (
-            f'Bearer realm="airhost-mcp", '
-            f'error="invalid_token", '
-            f'resource_metadata="{metadata_url}"'
-        )
-    }
+    parts = [
+        'Bearer realm="airhost-mcp"',
+        f'resource_metadata="{metadata_url}"',
+    ]
+    if error_code:
+        parts.insert(1, f'error="{error_code}"')
+    return {"WWW-Authenticate": ", ".join(parts)}
 
 
-def _unauthorized(request: Request, detail: str) -> HTTPException:
+def _unauthorized(request: Request, detail: str, *, token_present: bool = False) -> HTTPException:
+    # Only add error="invalid_token" when a token was actually present but invalid.
+    error_code = "invalid_token" if token_present else None
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=detail,
-        headers=_challenge_header(request),
+        headers=_challenge_header(request, error_code=error_code),
     )
 
 
@@ -156,10 +162,10 @@ async def _validate_via_userinfo(
         raise _unauthorized(request, "auth backend unavailable") from exc
 
     if resp.status_code == 401:
-        raise _unauthorized(request, "invalid token")
+        raise _unauthorized(request, "invalid token", token_present=True)
     if resp.status_code != 200:
         logger.warning("userinfo returned HTTP %s", resp.status_code)
-        raise _unauthorized(request, "auth backend unavailable")
+        raise _unauthorized(request, "auth backend unavailable", token_present=True)
 
     claims: dict[str, Any] = resp.json()
     return claims
@@ -219,19 +225,19 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
             verified = bool(claims.get("email_verified", False))
         logger.info("DEBUG auth: userinfo email=%r verified=%s", email, verified)
         if email is None:
-            raise _unauthorized(request, "token missing email claim")
+            raise _unauthorized(request, "token missing email claim", token_present=True)
         if not verified:
-            raise _unauthorized(request, "email not verified")
+            raise _unauthorized(request, "email not verified", token_present=True)
         if email.lower() not in settings.allowed_email_set:
             logger.info("DEBUG auth: email %r not in allowlist %s", email.lower(), settings.allowed_email_set)
-            raise _unauthorized(request, "email not in allowlist")
+            raise _unauthorized(request, "email not in allowlist", token_present=True)
         request.state.user_email = email.lower()
         logger.info("DEBUG auth: opaque token accepted for %s", email.lower())
         return claims
 
     kid = unverified_header.get("kid")
     if not kid:
-        raise _unauthorized(request, "token missing key id")
+        raise _unauthorized(request, "token missing key id", token_present=True)
 
     try:
         jwks = await _fetch_jwks(settings.auth0_domain)
@@ -256,7 +262,7 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
         )
     if matching_key is None:
         logger.info("DEBUG auth: no matching signing key for kid=%r", kid)
-        raise _unauthorized(request, "no matching signing key")
+        raise _unauthorized(request, "no matching signing key", token_present=True)
 
     try:
         claims = jwt.decode(
@@ -269,7 +275,7 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
         logger.info("DEBUG auth: JWT decode success, claims keys=%s", list(claims.keys()))
     except JWTError as exc:
         logger.info("Auth0 JWT rejected: %s (audience=%r issuer=%r)", exc, settings.auth0_audience, issuer)
-        raise _unauthorized(request, "invalid token") from exc
+        raise _unauthorized(request, "invalid token", token_present=True) from exc
 
     email, verified = _extract_email(claims)
     logger.info("DEBUG auth: JWT email=%r verified=%s", email, verified)
@@ -289,15 +295,17 @@ async def verify_oauth_token(request: Request) -> dict[str, Any]:
 
     if email is None:
         raise _unauthorized(
-            request, "token missing email claim (add Auth0 Action or check /userinfo scope)"
+            request,
+            "token missing email claim (add Auth0 Action or check /userinfo scope)",
+            token_present=True,
         )
     if not verified:
-        raise _unauthorized(request, "email not verified")
+        raise _unauthorized(request, "email not verified", token_present=True)
 
     email_lc = email.lower()
     if email_lc not in settings.allowed_email_set:
         logger.info("DEBUG auth: email %r not in allowlist %s", email_lc, settings.allowed_email_set)
-        raise _unauthorized(request, "email not in allowlist")
+        raise _unauthorized(request, "email not in allowlist", token_present=True)
 
     request.state.user_email = email_lc
     logger.info("DEBUG auth: JWT token accepted for %s", email_lc)
