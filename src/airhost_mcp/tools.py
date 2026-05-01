@@ -111,7 +111,9 @@ def register_tools(mcp: FastMCP, client: AirhostClient) -> None:
     ) -> list[dict]:
         """List reservations in a date range, optionally filtered by listing.
 
-        Useful for revenue / occupancy analysis. ``end_date`` is inclusive.
+        Returns basic reservation info (total, rate_plan_name, payment_status).
+        For OTA commission (手数料) use list_reservation_details instead.
+        ``end_date`` is inclusive.
         """
         _audit(
             ctx,
@@ -121,4 +123,30 @@ def register_tools(mcp: FastMCP, client: AirhostClient) -> None:
             end_date=end_date,
         )
         results = await client.list_reservations_in_range(listing_id, start_date, end_date)
+        return [r.model_dump(mode="json") for r in results]
+
+    @mcp.tool()
+    async def list_reservation_details(
+        ctx: Context,
+        start_date: date,
+        end_date: date,
+        listing_id: str | None = None,
+    ) -> list[dict]:
+        """List reservations with full financial detail including OTA commission (手数料).
+
+        Same as list_reservations_in_range but additionally populates
+        ``ota_commission_jpy`` for each OTA booking by fetching and parsing
+        the Airhost CSV export. This takes 10-20 s longer due to the async
+        export flow. Use this tool when OTA commission data is required;
+        use list_reservations_in_range for faster lookups that don't need it.
+        ``end_date`` is inclusive.
+        """
+        _audit(
+            ctx,
+            "list_reservation_details",
+            listing_id=listing_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        results = await client.list_reservations_with_details(listing_id, start_date, end_date)
         return [r.model_dump(mode="json") for r in results]

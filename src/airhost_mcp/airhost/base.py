@@ -156,3 +156,17 @@ class AirhostClient(ABC):
         start_date: date,
         end_date: date,
     ) -> list[Reservation]: ...
+
+    @abstractmethod
+    async def list_reservations_with_details(
+        self,
+        listing_id: str | None,
+        start_date: date,
+        end_date: date,
+    ) -> list[Reservation]:
+        """Like list_reservations_in_range but also populates ota_commission_jpy.
+
+        Slower (requires CSV export over ActionCable). Call explicitly when
+        OTA commission data is needed.
+        """
+        ...

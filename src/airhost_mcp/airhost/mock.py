@@ -234,3 +234,12 @@ class MockAirhostClient(AirhostClient):
                 out.append(self._observe(res))
             cur += timedelta(days=1)
         return out
+
+    async def list_reservations_with_details(
+        self,
+        listing_id: str | None,
+        start_date: date,
+        end_date: date,
+    ) -> list[Reservation]:
+        """Mock: same as list_reservations_in_range (no CSV export in mock)."""
+        return await self.list_reservations_in_range(listing_id, start_date, end_date)

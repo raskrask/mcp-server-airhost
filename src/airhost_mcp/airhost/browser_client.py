@@ -449,17 +449,14 @@ class BrowserAirhostClient(AirhostClient):
         occupies the date — that matches Airhost's own checkout-by-morning
         semantics (a 5/3→5/4 booking only occupies 5/3).
         """
-        async with self._page_and_context() as (page, context):
+        async with self._page() as page:
             bookings = await self._fetch_bookings(
                 page, house_id=listing_id, start_date=target_date, end_date=target_date
             )
             occupying = [
                 b for b in bookings if b.check_in <= target_date < b.check_out
             ]
-            commissions = await self._fetch_ota_commissions(
-                context, page, target_date, target_date
-            )
-            await self._enrich_with_invoice(page, occupying, ota_commissions=commissions)
+            await self._enrich_with_invoice(page, occupying)
             return occupying
 
     async def block_date(
@@ -485,6 +482,44 @@ class BrowserAirhostClient(AirhostClient):
         Airhost's calendar endpoint requires a house_id, so when listing_id
         is None we fan out across all houses the account manages and merge.
         """
+        async with self._page() as page:
+            if listing_id is not None:
+                house_ids = [listing_id]
+            else:
+                house_ids = await self._all_house_ids(page)
+
+            results = await asyncio.gather(
+                *[
+                    self._fetch_bookings(
+                        page, house_id=hid, start_date=start_date, end_date=end_date
+                    )
+                    for hid in house_ids
+                ],
+                return_exceptions=True,
+            )
+
+            out: list[Reservation] = []
+            for hid, res in zip(house_ids, results, strict=True):
+                if isinstance(res, BaseException):
+                    logger.warning("bookings fetch failed for house %s: %s", hid, res)
+                    continue
+                out.extend(res)
+            await self._enrich_with_invoice(page, out)
+            return out
+
+    async def list_reservations_with_details(
+        self,
+        listing_id: str | None,
+        start_date: date,
+        end_date: date,
+    ) -> list[Reservation]:
+        """Like list_reservations_in_range, but also populates ota_commission_jpy.
+
+        OTA commission is retrieved via an async CSV export over ActionCable
+        (the only Airhost data source that exposes it). This adds ~5-15 s of
+        latency and is rate-limited to one export per 30 s, so this method is
+        intentionally separate from the faster list_reservations_in_range.
+        """
         async with self._page_and_context() as (page, context):
             if listing_id is not None:
                 house_ids = [listing_id]
@@ -507,7 +542,8 @@ class BrowserAirhostClient(AirhostClient):
                     logger.warning("bookings fetch failed for house %s: %s", hid, res)
                     continue
                 out.extend(res)
-            # Fetch OTA commission data from CSV export (concurrent with invoice detail).
+
+            # Fetch invoice detail and OTA commission concurrently.
             commissions = await self._fetch_ota_commissions(
                 context, page, start_date, end_date
             )
