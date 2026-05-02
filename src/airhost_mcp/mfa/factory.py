@@ -18,14 +18,6 @@ def build_mfa_strategy(settings: Settings) -> MFAStrategy:
             code_regex=settings.mfa_code_regex,
             after_fetch=settings.mfa_after_fetch,
         )
-    if settings.mfa_strategy == "pubsub":
-        from .pubsub import PubSubMFAStrategy
-
-        return PubSubMFAStrategy(
-            project_id=settings.pubsub_project_id,
-            subscription=settings.pubsub_subscription,
-            code_regex=settings.mfa_code_regex,
-        )
     if settings.mfa_strategy == "manual":
         from .manual import ManualMFAStrategy
 

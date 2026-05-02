@@ -53,7 +53,7 @@ class Settings(BaseSettings):
     browser_headless: bool = True
 
     # MFA
-    mfa_strategy: Literal["gmail", "pubsub", "manual"] = "gmail"
+    mfa_strategy: Literal["gmail", "manual"] = "gmail"
     # Airhost MFA mail comes in two flavors:
     #   * Normal:    Subject "[Airhost One] ログインコードは 123456 です。"
     #                — code is in the subject; we capture it.
@@ -79,10 +79,6 @@ class Settings(BaseSettings):
     #   delete  — permanently delete (NOT recoverable; bypasses Trash)
     # Requires scope gmail.modify for anything other than "keep".
     mfa_after_fetch: Literal["keep", "read", "archive", "trash", "delete"] = "trash"
-
-    # Pub/Sub (future)
-    pubsub_project_id: str = ""
-    pubsub_subscription: str = ""
 
     # Session store
     session_store: Literal["local", "gcs"] = "local"
