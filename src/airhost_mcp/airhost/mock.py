@@ -15,6 +15,8 @@ from .base import (
     AirhostClient,
     Availability,
     BlockResult,
+    Folio,
+    FolioTransaction,
     Listing,
     Reservation,
     ReservationUpdate,
@@ -243,3 +245,48 @@ class MockAirhostClient(AirhostClient):
     ) -> list[Reservation]:
         """Mock: same as list_reservations_in_range (no CSV export in mock)."""
         return await self.list_reservations_in_range(listing_id, start_date, end_date)
+
+    async def get_folio(self, reservation_id: str) -> list[Folio]:
+        seed = int(hashlib.sha256(reservation_id.encode()).hexdigest()[:8], 16)
+        nightly = 20000 + (seed % 5) * 2000
+        extras = [
+            FolioTransaction(
+                transaction_id=f"{reservation_id}_t1",
+                type="invoice_item",
+                description=f"Accommodation R{seed % 1000000:06d}",
+                debit=float(nightly),
+                credit=0.0,
+                display_date=date.today(),
+            ),
+            FolioTransaction(
+                transaction_id=f"{reservation_id}_t2",
+                type="invoice_item",
+                description=f"1 x Sauna② R{(seed + 1) % 1000000:06d}",
+                debit=5000.0,
+                credit=0.0,
+                display_date=date.today(),
+            ),
+            FolioTransaction(
+                transaction_id=f"{reservation_id}_t3",
+                type="payment",
+                description="現地クレジット決済",
+                debit=0.0,
+                credit=float(nightly + 5000),
+                display_date=date.today(),
+                state="completed",
+            ),
+        ]
+        total = float(nightly + 5000)
+        return [
+            Folio(
+                folio_id=f"folio_{reservation_id}",
+                booking_id=reservation_id,
+                title=f"Mock Folio — {reservation_id[:8]}",
+                total_debit=total,
+                total_credit=total,
+                balance=0.0,
+                currency="JPY",
+                closed=False,
+                transactions=extras,
+            )
+        ]

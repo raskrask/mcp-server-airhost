@@ -40,6 +40,8 @@ from .base import (
     AirhostClient,
     Availability,
     BlockResult,
+    Folio,
+    FolioTransaction,
     Listing,
     Reservation,
     ReservationUpdate,
@@ -72,6 +74,33 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_folio(f: dict[str, Any]) -> Folio:
+    transactions = [
+        FolioTransaction(
+            transaction_id=t["id"],
+            type=t.get("type", ""),
+            description=t.get("description", ""),
+            debit=float(t.get("debit") or 0),
+            credit=float(t.get("credit") or 0),
+            display_date=date.fromisoformat(t["display_date"]) if t.get("display_date") else None,
+            state=t.get("state"),
+            order_id=t.get("order_id"),
+        )
+        for t in (f.get("transactions") or [])
+    ]
+    return Folio(
+        folio_id=f["id"],
+        booking_id=f["booking_id"],
+        title=f.get("title"),
+        total_debit=float(f.get("total_debit") or 0),
+        total_credit=float(f.get("total_credit") or 0),
+        balance=float(f.get("balance") or 0),
+        currency=f.get("currency", "JPY"),
+        closed=bool(f.get("closed")),
+        transactions=transactions,
+    )
 
 
 def _booking_to_reservation(
@@ -470,6 +499,16 @@ class BrowserAirhostClient(AirhostClient):
     ) -> Reservation:
         async with self._page() as page:  # noqa: F841
             raise NotImplementedError("update_reservation — TBD pending update API")
+
+    async def get_folio(self, reservation_id: str) -> list[Folio]:
+        async with self._page() as page:
+            url = f"{self._API_BASE}/accounting/folios/query?locale=ja"
+            body = {
+                "booking_ids": [reservation_id],
+                "field_sets_folio": "basic,receipts",
+            }
+            payload = await self._api_post(page, url, body)
+            return [_parse_folio(f) for f in (payload.get("data") or [])]
 
     async def list_reservations_in_range(
         self,
