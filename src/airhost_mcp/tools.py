@@ -126,6 +126,19 @@ def register_tools(mcp: FastMCP, client: AirhostClient) -> None:
         return [r.model_dump(mode="json") for r in results]
 
     @mcp.tool()
+    async def get_folio(ctx: Context, reservation_id: str) -> list[dict]:
+        """Return the folio (明細) for a reservation: all charges and payments.
+
+        Each item has ``type`` ("invoice_item" or "payment"), ``description``
+        (free text, e.g. "1 x Sauna② R971630271"), ``debit`` (charge in JPY),
+        and ``credit`` (payment in JPY). Use ``description`` to identify
+        specific charges such as sauna fees or pet fees.
+        """
+        _audit(ctx, "get_folio", reservation_id=reservation_id)
+        folios = await client.get_folio(reservation_id)
+        return [f.model_dump(mode="json") for f in folios]
+
+    @mcp.tool()
     async def list_reservation_details(
         ctx: Context,
         start_date: date,

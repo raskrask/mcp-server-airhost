@@ -97,6 +97,29 @@ class Reservation(BaseModel):
     notes: str | None = None  # populated from block_reason for blocked entries
 
 
+class FolioTransaction(BaseModel):
+    transaction_id: str
+    type: str  # "invoice_item" | "payment"
+    description: str
+    debit: float  # charge in JPY (0 for payments)
+    credit: float  # payment in JPY (0 for charges)
+    display_date: date | None = None
+    state: str | None = None  # payments: "completed" etc.
+    order_id: str | None = None
+
+
+class Folio(BaseModel):
+    folio_id: str
+    booking_id: str
+    title: str | None = None
+    total_debit: float
+    total_credit: float
+    balance: float
+    currency: str = "JPY"
+    closed: bool = False
+    transactions: list[FolioTransaction] = Field(default_factory=list)
+
+
 class BlockResult(BaseModel):
     listing_id: str
     target_date: date
@@ -168,5 +191,14 @@ class AirhostClient(ABC):
 
         Slower (requires CSV export over ActionCable). Call explicitly when
         OTA commission data is needed.
+        """
+        ...
+
+    @abstractmethod
+    async def get_folio(self, reservation_id: str) -> list[Folio]:
+        """Return folio(s) for a reservation, including all transactions.
+
+        Each transaction has a ``type`` of "invoice_item" (charges) or
+        "payment" and a free-text ``description`` (e.g. "1 x Sauna② R971…").
         """
         ...
