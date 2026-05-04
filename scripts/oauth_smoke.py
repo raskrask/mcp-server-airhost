@@ -7,7 +7,7 @@
     # リモートサーバー（Cloud Run）に対して実行
     MCP_CLIENT_ID=airhost-mcp \
     MCP_CLIENT_SECRET=<secret> \
-    MCP_PUBLIC_URL=https://airhost-mcp-134107996490.asia-northeast1.run.app \
+    MCP_PUBLIC_URL=https://airhost-mcp-XXXXXXXXXX.asia-northeast1.run.app \
     .venv/bin/python scripts/oauth_smoke.py
 
     # ローカルサーバーに対して実行（DEV_DISABLE_AUTH=true で起動中の場合は --no-auth）
