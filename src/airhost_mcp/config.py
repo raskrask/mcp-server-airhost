@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,22 +21,16 @@ class Settings(BaseSettings):
     port: int = 8080
     mcp_mount_path: str = "/mcp"
 
-    # ---- OAuth 2.1 / Auth0 ----
-    # Auth0 tenant domain, e.g. "mot-cozy-space.jp.auth0.com".
-    auth0_domain: str = ""
-    # API identifier configured in Auth0; the JWT ``aud`` claim must match.
-    auth0_audience: str = ""
-    # Optional explicit issuer override. Defaults to "https://{auth0_domain}/".
-    auth0_issuer: str = ""
-    # Comma-separated allowlist of authorized email addresses. Compared
-    # case-insensitively against the verified ``email`` claim.
-    mcp_allowed_emails: str = ""
-    # Pre-registered Auth0 application client_id. When set, the server exposes
-    # a /oidc/register endpoint that always returns this fixed client_id instead
-    # of forwarding DCR to Auth0. Prevents new Auth0 apps from being created on
-    # every new MCP client connection (avoids "too_many_entities" quota errors).
-    # Create one Auth0 Native app manually and paste its client_id here.
-    auth0_client_id: str = ""
+    # ---- Self-hosted OAuth 2.1 ----
+    # client_id to register in Claude's MCP connector (not secret).
+    mcp_client_id: str = ""
+    # client_secret to register in Claude's MCP connector (store in Secret Manager).
+    mcp_client_secret: str = ""
+    # HMAC-SHA256 signing key for issued JWTs (store in Secret Manager).
+    mcp_token_secret: str = ""
+    # Access token lifetime in days. Long lifetime avoids re-auth on token expiry
+    # since Claude's connector does not reliably implement refresh token rotation.
+    mcp_access_token_ttl_days: int = 365
     # Public origin (and optional path) of this MCP server, used in OAuth
     # protected-resource metadata. If empty, derived from the first incoming
     # request's ``base_url`` and cached.
@@ -89,12 +84,11 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
-    @property
-    def allowed_email_set(self) -> frozenset[str]:
-        """Lower-cased, stripped allowlist of accepted user emails."""
-        return frozenset(
-            e.strip().lower() for e in self.mcp_allowed_emails.split(",") if e.strip()
-        )
+    @field_validator("mcp_client_secret", "mcp_token_secret", mode="before")
+    @classmethod
+    def strip_secret(cls, v: str) -> str:
+        return v.strip() if isinstance(v, str) else v
+
 
 
 _settings: Settings | None = None

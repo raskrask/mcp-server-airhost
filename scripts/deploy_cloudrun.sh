@@ -7,13 +7,15 @@
 # Prereqs (one-time):
 #   - gcloud auth login + gcloud config set project
 #   - billing enabled
-#   - Auth0 tenant + API created, OIDC Dynamic Application Registration enabled
-#   - One Auth0 Native app created manually; set AUTH0_CLIENT_ID to its client_id
-#     (allows http://localhost callback URLs — Auth0 ignores port for localhost)
 #   - GCS bucket created for session storage
 #   - Secret Manager secrets created:
-#       MCP_ALLOWED_EMAILS, AIRHOST_USERNAME, AIRHOST_PASSWORD,
+#       MCP_CLIENT_SECRET, MCP_TOKEN_SECRET,
+#       AIRHOST_USERNAME, AIRHOST_PASSWORD,
 #       GMAIL_CREDENTIALS, GMAIL_TOKEN
+#
+# Generate secrets locally (end='' avoids trailing newline that breaks Secret Manager comparison):
+#   python3 -c "import secrets; print(secrets.token_urlsafe(32), end='')"  # MCP_CLIENT_SECRET
+#   python3 -c "import secrets; print(secrets.token_urlsafe(48), end='')"  # MCP_TOKEN_SECRET
 
 set -euo pipefail
 
@@ -21,36 +23,28 @@ set -euo pipefail
 REGION="${REGION:-asia-northeast1}"
 SERVICE="${SERVICE:-airhost-mcp}"
 SESSION_GCS_BUCKET="${SESSION_GCS_BUCKET:?SESSION_GCS_BUCKET env var required (existing GCS bucket name)}"
-AUTH0_DOMAIN="${AUTH0_DOMAIN:?AUTH0_DOMAIN env var required (e.g. tenant.region.auth0.com)}"
-AUTH0_AUDIENCE="${AUTH0_AUDIENCE:?AUTH0_AUDIENCE env var required (Auth0 API identifier)}"
-AUTH0_CLIENT_ID="${AUTH0_CLIENT_ID:?AUTH0_CLIENT_ID env var required (pre-registered Auth0 Native app client_id)}"
-AUTH0_ISSUER="${AUTH0_ISSUER:-}"
+MCP_CLIENT_ID="${MCP_CLIENT_ID:-airhost-mcp}"
+MCP_ACCESS_TOKEN_TTL_DAYS="${MCP_ACCESS_TOKEN_TTL_DAYS:-365}"
 MCP_PUBLIC_URL="${MCP_PUBLIC_URL:-}"
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 
 echo "Building image with Cloud Build..."
 gcloud builds submit --tag "gcr.io/${PROJECT_ID}/${SERVICE}:latest" --project "${PROJECT_ID}"
 
-# Playwright + Chromium needs significantly more memory and CPU than a plain
-# Python service. 2Gi / 2 vCPU is a safe starting point; tune down later.
-# Gmail credential files are mounted from Secret Manager as separate file paths.
-# gcloud run only allows one secret per directory, so each gets its own dir.
 GMAIL_CREDS_PATH="/secrets/gmail-credentials/credentials.json"
 GMAIL_TOKEN_PATH="/secrets/gmail-token/token.json"
 
 ENV_VARS="SESSION_STORE=gcs,SESSION_GCS_BUCKET=${SESSION_GCS_BUCKET},BROWSER_HEADLESS=true"
-ENV_VARS+=",AUTH0_DOMAIN=${AUTH0_DOMAIN},AUTH0_AUDIENCE=${AUTH0_AUDIENCE},AUTH0_CLIENT_ID=${AUTH0_CLIENT_ID}"
+ENV_VARS+=",MCP_CLIENT_ID=${MCP_CLIENT_ID},MCP_ACCESS_TOKEN_TTL_DAYS=${MCP_ACCESS_TOKEN_TTL_DAYS}"
 ENV_VARS+=",AIRHOST_CLIENT=browser,MFA_STRATEGY=gmail"
 ENV_VARS+=",GMAIL_CREDENTIALS_PATH=${GMAIL_CREDS_PATH},GMAIL_TOKEN_PATH=${GMAIL_TOKEN_PATH}"
-if [[ -n "${AUTH0_ISSUER}" ]]; then
-  ENV_VARS+=",AUTH0_ISSUER=${AUTH0_ISSUER}"
-fi
 if [[ -n "${MCP_PUBLIC_URL}" ]]; then
   ENV_VARS+=",MCP_PUBLIC_URL=${MCP_PUBLIC_URL}"
 fi
 
-# Secrets wired as env vars (credentials) and file mounts (gmail JSON files).
-SECRETS="MCP_ALLOWED_EMAILS=MCP_ALLOWED_EMAILS:latest"
+# MCP_CLIENT_SECRET and MCP_TOKEN_SECRET are secrets; wired via Secret Manager.
+SECRETS="MCP_CLIENT_SECRET=MCP_CLIENT_SECRET:latest"
+SECRETS+=",MCP_TOKEN_SECRET=MCP_TOKEN_SECRET:latest"
 SECRETS+=",AIRHOST_USERNAME=AIRHOST_USERNAME:latest"
 SECRETS+=",AIRHOST_PASSWORD=AIRHOST_PASSWORD:latest"
 SECRETS+=",${GMAIL_CREDS_PATH}=GMAIL_CREDENTIALS:latest"
@@ -83,3 +77,8 @@ gcloud run deploy "${DEPLOY_ARGS[@]}"
 
 echo
 echo "Done."
+echo
+echo "Next: register MCP connector in Claude with:"
+echo "  URL:           ${MCP_PUBLIC_URL:-<Cloud Run URL>}/mcp/"
+echo "  Client ID:     ${MCP_CLIENT_ID}"
+echo "  Client Secret: (value of MCP_CLIENT_SECRET secret)"
