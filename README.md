@@ -382,5 +382,7 @@ mcp-server-airhost/
 - **Pub/Sub MFA strategy**: 枠だけ用意（`MFA_STRATEGY=pubsub`）。Gmail forwarder + Zapier or 直接 Pub/Sub push のパイプラインを組んだら有効化。
 - **`block_date` の本実装**: 読み取り系 4 ツールは API 経由で実装済みだが、書き込み系の `block_date` はまだ `NotImplementedError`。Airhost UI でブロックを **作成**したときに走る POST と、**削除**したときに走る DELETE/POST を Network タブで観察し、URL とリクエスト/レスポンスの shape をメモ → 実装する。本物データへの影響を避けるため、テストは遠い未来の空き日（例: 2027-12-31）でやる。
 - **`update_reservation` の本実装**: 同じく未実装。予約画面で日付変更 / ゲスト数変更 / メモ追記 をしたときに走る PATCH/PUT を観察 → 実装。Airbnb / Booking.com 系の予約は OTA 側からの変更しか受け付けない可能性があるので、対応できる項目を最初に整理してから実装。
-- **Cloud Run の min-instances 切替**: 現状 0（コールドスタート許容）。Playwright + Chromium だと初回 5–10 秒待つ。実運用に入ったら min=1 へ（月数千円のコスト増）。
+- ~~**Cloud Run の min-instances 切替**~~: ✅ min=1 / max=1 に変更済み。
+- **OAuth state の GCS 永続化**: `oauth_server.py` の認証コード (`_auth_codes`) とリフレッシュトークン (`_refresh_tokens`) が現在インメモリのため、インスタンス再起動（デプロイ・メンテ等）でリセットされる。アクセストークンは 365 日有効な JWT なので実害は限定的だが、長期的には GCS に永続化すべき。既存の `SessionStore` と同じバケットに `oauth/auth_codes/<code>.json`・`oauth/refresh_tokens/<token>.json` として保存するのが最短。
+- **GET /mcp 409 ループ問題**: Cloud Run のロードバランサーが SSE 接続を黙って切断するが FastMCP がそれを検知できず、Claude のコネクタが再接続しようとすると 409 が返り続ける。POST（ツール呼び出し）は正常動作するため実害は軽微だが、根本解決には FastMCP 側での SSE keepalive 実装または接続管理の改善が必要。
 - **エラー通知 / モニタリング**: Cloud Logging のエラー検知 → メール / Slack 通知。今は無し。
