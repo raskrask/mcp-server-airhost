@@ -63,7 +63,7 @@ DEPLOY_ARGS=(
   --concurrency 4
   --cpu 2
   --memory 2Gi
-  --timeout 300
+  --timeout 3600
   --set-env-vars "${ENV_VARS}"
   --set-secrets "${SECRETS}"
 )
