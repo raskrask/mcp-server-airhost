@@ -26,6 +26,7 @@ from .airhost import build_airhost_client
 from .auth import verify_oauth_token
 from .config import get_settings
 from .oauth_server import build_router as build_oauth_router
+from .oauth_server import load_refresh_tokens_from_gcs
 from .tools import register_tools
 from .well_known import build_router as build_well_known_router
 
@@ -66,6 +67,9 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # Restore persisted OAuth refresh tokens from GCS before accepting traffic.
+        if settings.session_gcs_bucket:
+            await load_refresh_tokens_from_gcs(settings.session_gcs_bucket)
         async with mcp.session_manager.run():
             yield
 

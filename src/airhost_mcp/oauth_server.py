@@ -25,15 +25,18 @@ Flow
 
 Token storage
 -------------
-Authorization codes and refresh tokens are kept in module-level dicts.
-Cloud Run instances may be recycled, but access tokens are long-lived
-(default 365 days) so reconnect after a cold start is rare.
+Refresh tokens are kept in a module-level dict (fast in-process lookup)
+AND persisted to GCS so they survive instance restarts / Cloud Run recycling.
+On startup, call ``load_refresh_tokens_from_gcs()`` to reload persisted tokens.
+Authorization codes are short-lived (10 min) and are NOT persisted.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 import logging
 import secrets
 import time
@@ -51,7 +54,98 @@ _auth_codes: dict[str, dict[str, Any]] = {}
 _AUTH_CODE_TTL = 600  # 10 minutes
 
 # Refresh tokens: token → {client_id, exp}
+# In-memory primary store; GCS is the durable backing store.
 _refresh_tokens: dict[str, dict[str, Any]] = {}
+
+# GCS bucket name for token persistence (set by load_refresh_tokens_from_gcs).
+_rt_gcs_bucket: str = ""
+_RT_GCS_PREFIX = "oauth_refresh/"
+
+
+# ---------------------------------------------------------------------------
+# GCS persistence helpers
+# ---------------------------------------------------------------------------
+
+def _rt_blob_name(token: str) -> str:
+    """Stable, filesystem-safe GCS object name for a refresh token."""
+    # Use a SHA-256 hex digest so the raw token never appears in object names.
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    return f"{_RT_GCS_PREFIX}{digest}.json"
+
+
+async def load_refresh_tokens_from_gcs(bucket_name: str) -> None:
+    """Load all persisted refresh tokens from GCS into the in-memory dict.
+
+    Call once at application startup.  Expired tokens are skipped and
+    deleted from GCS lazily.
+    """
+    global _rt_gcs_bucket
+    _rt_gcs_bucket = bucket_name
+
+    try:
+        from google.cloud import storage as gcs  # type: ignore[import-untyped]
+        client = gcs.Client()
+        bucket = client.bucket(bucket_name)
+
+        def _list_and_load() -> list[tuple[str, dict[str, Any]]]:
+            results = []
+            for blob in client.list_blobs(bucket_name, prefix=_RT_GCS_PREFIX):
+                try:
+                    data = blob.download_as_bytes()
+                    obj = json.loads(data.decode("utf-8"))
+                    # obj contains {token, client_id, exp}
+                    results.append((obj["token"], {"client_id": obj["client_id"], "exp": obj["exp"]}))
+                except Exception as exc:
+                    logger.warning("oauth: failed to read GCS token blob %s: %s", blob.name, exc)
+            return results
+
+        items = await asyncio.to_thread(_list_and_load)
+        now = int(time.time())
+        loaded = 0
+        for token, entry in items:
+            if entry["exp"] < now:
+                # Expired — delete asynchronously
+                asyncio.create_task(_gcs_delete_rt(token))
+            else:
+                _refresh_tokens[token] = entry
+                loaded += 1
+        logger.info("oauth: loaded %d refresh token(s) from GCS bucket %r", loaded, bucket_name)
+    except Exception as exc:
+        logger.error("oauth: failed to load refresh tokens from GCS: %s", exc)
+
+
+async def _gcs_save_rt(token: str, entry: dict[str, Any]) -> None:
+    """Persist a single refresh token entry to GCS (fire-and-forget friendly)."""
+    if not _rt_gcs_bucket:
+        return
+    try:
+        from google.cloud import storage as gcs  # type: ignore[import-untyped]
+        client = gcs.Client()
+        bucket = client.bucket(_rt_gcs_bucket)
+        blob = bucket.blob(_rt_blob_name(token))
+        payload = json.dumps(
+            {"token": token, "client_id": entry["client_id"], "exp": entry["exp"]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        await asyncio.to_thread(blob.upload_from_string, payload, content_type="application/json")
+    except Exception as exc:
+        logger.error("oauth: failed to save refresh token to GCS: %s", exc)
+
+
+async def _gcs_delete_rt(token: str) -> None:
+    """Delete a refresh token from GCS."""
+    if not _rt_gcs_bucket:
+        return
+    try:
+        from google.cloud import storage as gcs  # type: ignore[import-untyped]
+        client = gcs.Client()
+        bucket = client.bucket(_rt_gcs_bucket)
+        blob = bucket.blob(_rt_blob_name(token))
+        exists = await asyncio.to_thread(blob.exists)
+        if exists:
+            await asyncio.to_thread(blob.delete)
+    except Exception as exc:
+        logger.warning("oauth: failed to delete refresh token from GCS: %s", exc)
 
 
 def _issue_access_token(client_id: str, server_url: str, ttl_days: int, token_secret: str) -> str:
@@ -67,12 +161,15 @@ def _issue_access_token(client_id: str, server_url: str, ttl_days: int, token_se
     return jose_jwt.encode(claims, token_secret, algorithm="HS256")
 
 
-def _issue_refresh_token(client_id: str, ttl_days: int = 365) -> str:
+async def _issue_refresh_token(client_id: str, ttl_days: int = 365) -> str:
+    """Issue a new refresh token, persist to GCS, and store in memory."""
     token = secrets.token_urlsafe(32)
-    _refresh_tokens[token] = {
+    entry: dict[str, Any] = {
         "client_id": client_id,
         "exp": int(time.time()) + ttl_days * 86400,
     }
+    _refresh_tokens[token] = entry
+    asyncio.create_task(_gcs_save_rt(token, entry))
     return token
 
 
@@ -199,7 +296,7 @@ def build_router() -> APIRouter:
                 settings.mcp_access_token_ttl_days,
                 settings.mcp_token_secret,
             )
-            rt = _issue_refresh_token(client_id)
+            rt = await _issue_refresh_token(client_id)
             logger.info("token: issued access+refresh for client_id=%r", client_id)
             return JSONResponse({
                 "access_token": access_token,
@@ -217,13 +314,15 @@ def build_router() -> APIRouter:
                 return _error("invalid_grant", "refresh_token expired")
             if entry["client_id"] != client_id:
                 return _error("invalid_grant", "client_id mismatch")
+            # Delete old token from GCS (fire-and-forget).
+            asyncio.create_task(_gcs_delete_rt(refresh_token))
 
             access_token = _issue_access_token(
                 client_id, server_url,
                 settings.mcp_access_token_ttl_days,
                 settings.mcp_token_secret,
             )
-            new_rt = _issue_refresh_token(client_id)
+            new_rt = await _issue_refresh_token(client_id)
             logger.info("token: refreshed access token for client_id=%r", client_id)
             return JSONResponse({
                 "access_token": access_token,
