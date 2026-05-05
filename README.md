@@ -384,3 +384,4 @@ mcp-server-airhost/
 - **`update_reservation` の本実装**: 同じく未実装。予約画面で日付変更 / ゲスト数変更 / メモ追記 をしたときに走る PATCH/PUT を観察 → 実装。Airbnb / Booking.com 系の予約は OTA 側からの変更しか受け付けない可能性があるので、対応できる項目を最初に整理してから実装。
 - **Cloud Run の min-instances 切替**: 現状 0（コールドスタート許容）。Playwright + Chromium だと初回 5–10 秒待つ。実運用に入ったら min=1 へ（月数千円のコスト増）。
 - **エラー通知 / モニタリング**: Cloud Logging のエラー検知 → メール / Slack 通知。今は無し。
+- **GET /mcp 409 Conflict ループ**: Cloud Run LB が SSE 接続を無音でクローズするため、FastMCP が同一セッションの再接続を 409 で拒否することがある。POST の tool call 自体は成功するため実害は限定的だが、Claude のコネクタが 409 ループに入ると接続が不安定になる。FastMCP の内部セッション管理（`StreamableHTTPSessionManager`）に手を入れるか、セッション ID を使い捨てにするプロキシを挟む必要がある。
