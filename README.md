@@ -386,3 +386,4 @@ mcp-server-airhost/
 - **OAuth state の GCS 永続化**: `oauth_server.py` の認証コード (`_auth_codes`) とリフレッシュトークン (`_refresh_tokens`) が現在インメモリのため、インスタンス再起動（デプロイ・メンテ等）でリセットされる。アクセストークンは 365 日有効な JWT なので実害は限定的だが、長期的には GCS に永続化すべき。既存の `SessionStore` と同じバケットに `oauth/auth_codes/<code>.json`・`oauth/refresh_tokens/<token>.json` として保存するのが最短。
 - **GET /mcp 409 ループ問題**: Cloud Run のロードバランサーが SSE 接続を黙って切断するが FastMCP がそれを検知できず、Claude のコネクタが再接続しようとすると 409 が返り続ける。POST（ツール呼び出し）は正常動作するため実害は軽微だが、根本解決には FastMCP 側での SSE keepalive 実装または接続管理の改善が必要。
 - **エラー通知 / モニタリング**: Cloud Logging のエラー検知 → メール / Slack 通知。今は無し。
+- **GET /mcp 409 Conflict ループ**: Cloud Run LB が SSE 接続を無音でクローズするため、FastMCP が同一セッションの再接続を 409 で拒否することがある。POST の tool call 自体は成功するため実害は限定的だが、Claude のコネクタが 409 ループに入ると接続が不安定になる。FastMCP の内部セッション管理（`StreamableHTTPSessionManager`）に手を入れるか、セッション ID を使い捨てにするプロキシを挟む必要がある。
