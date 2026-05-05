@@ -314,15 +314,70 @@ def _test_mcp(base_url: str, token: str | None) -> int:
         _fail(f"HTTP {r.status_code}: {r.text[:300]}")
         return 1
 
+    tool_names: list[str] = []
     try:
         body = r.json()
-        tools = body.get("result", {}).get("tools", [])
-        _ok(f"tools/list 成功 — {len(tools)} ツール取得")
-        for t in tools:
-            _info("  tool", t.get("name"))
+        tool_names = [t.get("name", "") for t in body.get("result", {}).get("tools", [])]
+        _ok(f"tools/list 成功 — {len(tool_names)} ツール取得")
+        for name in tool_names:
+            _info("  tool", name)
     except Exception:
-        _ok(f"HTTP {r.status_code} (SSE形式)")
+        _ok(f"HTTP {r.status_code} (SSE形式 — JSON パース不要)")
         _info("body preview", r.text[:200])
+
+    # ------------------------------------------------------------------
+    # Step 9: tools/call — list_listings (実際に Airhost API を叩く)
+    # tools/list はツール定義を返すだけで Airhost には接触しない。
+    # 実際の疎通確認には tools/call が必要。
+    # ------------------------------------------------------------------
+    _step("Step 9: POST /mcp (tools/call → list_listings) [Airhost 実疎通]")
+    call_payload = {
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {"name": "list_listings", "arguments": {}},
+    }
+    with httpx.Client(timeout=120) as http:  # login + MFA で最大 2 分
+        r = http.post(mcp_url, json=call_payload, headers=headers)
+
+    if r.status_code not in (200, 202):
+        _fail(f"HTTP {r.status_code}: {r.text[:300]}")
+        return 1
+
+    raw = r.text
+    # SSE or JSON どちらでも result を抽出する。
+    result_text: str | None = None
+    try:
+        # JSON 直レスポンスの場合
+        result_text = json.dumps(r.json().get("result"), ensure_ascii=False)
+    except Exception:
+        # SSE の場合: `data: {...}` 行を探す
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                payload_str = line[5:].strip()
+                try:
+                    obj = json.loads(payload_str)
+                    if "result" in obj:
+                        result_text = json.dumps(obj["result"], ensure_ascii=False)
+                        break
+                    if "error" in obj:
+                        _fail(f"tools/call error: {obj['error']}")
+                        return 1
+                except Exception:
+                    pass
+
+    if result_text is None:
+        _fail("list_listings のレスポンスから result を抽出できませんでした")
+        _info("raw (200 chars)", raw[:200])
+        return 1
+
+    # エラーメッセージが混入していないか確認
+    if '"isError":true' in result_text or '"isError": true' in result_text:
+        _fail(f"list_listings がエラーを返しました: {result_text[:300]}")
+        return 1
+
+    _ok("list_listings 成功 — Airhost API 疎通確認済み")
+    _info("result preview", result_text[:200])
 
     print(f"\n{'='*60}")
     print("  🎉 全ステップ成功")
