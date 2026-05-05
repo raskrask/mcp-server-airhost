@@ -58,12 +58,12 @@ DEPLOY_ARGS=(
   --platform managed
   --allow-unauthenticated
   --port 8080
-  --min-instances 0
-  --max-instances 2
+  --min-instances 1
+  --max-instances 1
   --concurrency 4
   --cpu 2
   --memory 2Gi
-  --timeout 300
+  --timeout 3600
   --set-env-vars "${ENV_VARS}"
   --set-secrets "${SECRETS}"
 )

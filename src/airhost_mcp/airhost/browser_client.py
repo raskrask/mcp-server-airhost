@@ -214,6 +214,15 @@ class BrowserAirhostClient(AirhostClient):
         ``_page()`` is a thin wrapper over this. Most methods only need the
         page; ``_fetch_ota_commissions`` also needs the context so it can read
         the live cookie jar for the ActionCable WebSocket handshake.
+
+        Session handling
+        ----------------
+        If a persisted storage_state is available and not locally expired, it
+        is loaded into a new browser context.  We then *validate* the session
+        with a cheap API ping before handing control to the caller.  If the
+        ping fails (Airhost server-side session expired, empty body, non-JSON
+        response, or HTTP error), we fall back to a full login so the caller
+        never sees an expired-session error.
         """
         browser = await self._ensure_browser()
         record = await self._session_store.load(self._username)
@@ -226,11 +235,46 @@ class BrowserAirhostClient(AirhostClient):
             page = await context.new_page()
             if storage_state is None:
                 await self._login(page, context)
+            else:
+                # Validate that the cached session is still alive.
+                if not await self._is_session_alive(page):
+                    logger.info(
+                        "Cached Airhost session is no longer valid; re-logging in."
+                    )
+                    await self._login(page, context)
             yield page, context
             # Save updated storage_state on successful exit.
             await self._persist_session(context)
         finally:
             await context.close()
+
+    async def _is_session_alive(self, page: Page) -> bool:
+        """Return True when the stored session cookies are still accepted by Airhost.
+
+        Hits the lightweight /pms/account endpoint.  Returns False on any
+        HTTP error, network error, or non-JSON / empty body — all of which
+        indicate the session has expired or is otherwise unusable.
+        """
+        try:
+            resp = await page.request.get(
+                f"{self._API_BASE}/pms/account?locale=ja",
+                timeout=10_000,  # 10 s
+            )
+            if not resp.ok:
+                logger.info("_is_session_alive: HTTP %d → session dead", resp.status)
+                return False
+            body = await resp.body()
+            if not body:
+                logger.info("_is_session_alive: empty body → session dead")
+                return False
+            import json as _json
+            data = _json.loads(body)
+            alive = bool(data.get("success") or data.get("data"))
+            logger.info("_is_session_alive: success=%s alive=%s", data.get("success"), alive)
+            return alive
+        except Exception as exc:
+            logger.info("_is_session_alive: exception %s → session dead", exc)
+            return False
 
     async def _persist_session(self, context: BrowserContext) -> None:
         state = await context.storage_state()
