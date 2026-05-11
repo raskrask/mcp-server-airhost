@@ -32,6 +32,7 @@ class GmailMFAStrategy(MFAStrategy):
         *,
         credentials_path: str,
         token_path: str,
+        token_secret_name: str = "",
         sender: str,
         subject_regex: str,
         code_regex: str,
@@ -40,11 +41,64 @@ class GmailMFAStrategy(MFAStrategy):
     ) -> None:
         self._credentials_path = credentials_path
         self._token_path = token_path
+        self._token_secret_name = token_secret_name
         self._sender = sender
         self._subject_re = re.compile(subject_regex, re.IGNORECASE)
         self._code_re = re.compile(code_regex)
         self._after_fetch = after_fetch
         self._poll_interval = poll_interval
+
+    def _writeback_token(self, creds: Credentials) -> None:
+        """Persist a refreshed token.
+
+        Tries the local file first (works in development).  On Cloud Run the
+        Secret Manager volume mount is read-only, so falls back to writing a
+        new Secret Manager version when ``token_secret_name`` is configured.
+        This keeps the refresh token alive across instance restarts.
+        """
+        token_json = creds.to_json()
+        token_file = Path(self._token_path)
+
+        # Local file (works in dev; fails silently on Cloud Run read-only mount).
+        try:
+            token_file.write_text(token_json, encoding="utf-8")
+            logger.debug("gmail token written back to file %s", self._token_path)
+            return
+        except OSError as exc:
+            logger.debug("gmail token file writeback failed (%s); trying Secret Manager", exc)
+
+        # Secret Manager writeback (Cloud Run).
+        if not self._token_secret_name:
+            logger.warning(
+                "gmail token writeback: file is read-only and GMAIL_TOKEN_SECRET_NAME is not set"
+            )
+            return
+        try:
+            import os
+            from google.cloud import secretmanager  # type: ignore[import-untyped]
+
+            project_id = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCLOUD_PROJECT")
+            if not project_id:
+                import urllib.request
+                req = urllib.request.Request(
+                    "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+                    headers={"Metadata-Flavor": "Google"},
+                )
+                project_id = urllib.request.urlopen(req, timeout=3).read().decode()
+
+            sm = secretmanager.SecretManagerServiceClient()
+            sm.add_secret_version(
+                request={
+                    "parent": f"projects/{project_id}/secrets/{self._token_secret_name}",
+                    "payload": {"data": token_json.encode("utf-8")},
+                }
+            )
+            logger.info(
+                "gmail token written back to Secret Manager secret %r",
+                self._token_secret_name,
+            )
+        except Exception as exc:
+            logger.warning("gmail token Secret Manager writeback failed: %s", exc)
 
     def _get_creds(self) -> Credentials:
         token_file = Path(self._token_path)
@@ -55,20 +109,14 @@ class GmailMFAStrategy(MFAStrategy):
             return creds
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
-            try:
-                token_file.write_text(creds.to_json(), encoding="utf-8")
-            except OSError as exc:
-                # Secret Manager volume mounts are read-only; writeback failure
-                # is non-fatal — the in-memory creds are still valid and the
-                # next startup will re-refresh from the same refresh_token.
-                logger.warning("gmail token writeback failed (read-only mount?): %s", exc)
+            self._writeback_token(creds)
             return creds
         # First-time consent flow. Local only — Cloud Run should ship a pre-built token.
         flow = InstalledAppFlow.from_client_secrets_file(
             self._credentials_path, GMAIL_SCOPES
         )
         creds = flow.run_local_server(port=0)
-        token_file.write_text(creds.to_json(), encoding="utf-8")
+        self._writeback_token(creds)
         return creds
 
     def _search_query(self, since_epoch: float) -> str:

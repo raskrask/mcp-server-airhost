@@ -13,6 +13,7 @@ def build_mfa_strategy(settings: Settings) -> MFAStrategy:
         return GmailMFAStrategy(
             credentials_path=settings.gmail_credentials_path,
             token_path=settings.gmail_token_path,
+            token_secret_name=settings.gmail_token_secret_name,
             sender=settings.mfa_sender,
             subject_regex=settings.mfa_subject_regex,
             code_regex=settings.mfa_code_regex,

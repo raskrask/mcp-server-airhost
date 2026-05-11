@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # Gmail
     gmail_credentials_path: str = "./gmail_credentials.json"
     gmail_token_path: str = "./gmail_token.json"
+    # Secret Manager secret name for the Gmail token (e.g. "GMAIL_TOKEN").
+    # When set, a refreshed token is written back to Secret Manager so it
+    # survives instance restarts on Cloud Run (read-only volume mounts cannot
+    # be written to directly).  Leave empty for local development.
+    gmail_token_secret_name: str = ""
     # What to do with the MFA email after extracting the code.
     #   keep    — leave in inbox untouched (default for safety)
     #   read    — mark as read only
