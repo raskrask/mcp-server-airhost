@@ -21,6 +21,7 @@ from .base import (
     Reservation,
     ReservationUpdate,
     RoomType,
+    RoomTypeAvailability,
     RoomUnit,
 )
 
@@ -141,13 +142,38 @@ class MockAirhostClient(AirhostClient):
         listing = next((l for l in _FIXED_LISTINGS if l.listing_id == listing_id), None)
         if listing is None:
             raise ValueError(f"unknown listing_id: {listing_id}")
-        # 70%-ish availability, deterministic on (listing, date).
         seed = _seed(listing_id, target_date)
+        available = (seed % 10) >= 3
+
+        rt_avail: list[RoomTypeAvailability] = []
+        for rt in listing.room_types:
+            rt_seed = _seed(rt.room_type_id, target_date)
+            # Simulate seasonal pricing: base ± up to 8 steps of 2000 JPY
+            base = rt.nightly_rate_jpy or 20000
+            date_price = base + (rt_seed % 9 - 4) * 2000  # ±8000 seasonal swing
+            avail_units = len(rt.room_units) if available else 0
+            rt_avail.append(
+                RoomTypeAvailability(
+                    room_type_id=rt.room_type_id,
+                    name=rt.name,
+                    total_units=len(rt.room_units),
+                    available_units=avail_units,
+                    nightly_rate_jpy=date_price,
+                    extra_guest_price_jpy=3000,
+                    guests_included=2,
+                )
+            )
+
+        cheapest = min(
+            (r.nightly_rate_jpy for r in rt_avail if r.available_units > 0 and r.nightly_rate_jpy),
+            default=None,
+        )
         return Availability(
             listing_id=listing_id,
             target_date=target_date,
-            available=(seed % 10) >= 3,
-            nightly_rate_jpy=_primary_rate(listing),
+            available=available,
+            nightly_rate_jpy=cheapest,
+            room_types=rt_avail,
         )
 
     def _seeded_reservation(self, listing_id: str, target_date: date) -> Reservation | None:
@@ -248,45 +274,93 @@ class MockAirhostClient(AirhostClient):
 
     async def get_folio(self, reservation_id: str) -> list[Folio]:
         seed = int(hashlib.sha256(reservation_id.encode()).hexdigest()[:8], 16)
-        nightly = 20000 + (seed % 5) * 2000
-        extras = [
+        reservation = self._observed.get(reservation_id)
+
+        transactions: list[FolioTransaction] = []
+        total_debit = 0.0
+
+        if reservation:
+            # Per-night breakdown: 基本料金 (seasonal) + 人数料金 per night
+            for i in range(reservation.nights):
+                night_date = reservation.check_in + timedelta(days=i)
+                night_seed = _seed(reservation.listing_id, night_date)
+                base_rate = 15000 + (night_seed % 8) * 2000  # seasonality: 15000–29000
+                person_rate = 1000 * reservation.guests
+
+                transactions.append(
+                    FolioTransaction(
+                        transaction_id=f"{reservation_id}_base_{i}",
+                        type="invoice_item",
+                        description="基本料金",
+                        debit=float(base_rate),
+                        credit=0.0,
+                        display_date=night_date,
+                    )
+                )
+                transactions.append(
+                    FolioTransaction(
+                        transaction_id=f"{reservation_id}_person_{i}",
+                        type="invoice_item",
+                        description=f"人数料金 ({reservation.guests}名)",
+                        debit=float(person_rate),
+                        credit=0.0,
+                        display_date=night_date,
+                    )
+                )
+                total_debit += base_rate + person_rate
+
+            first_date = reservation.check_in
+        else:
+            # Fallback when reservation hasn't been fetched yet
+            nightly = 20000 + (seed % 5) * 2000
+            transactions.append(
+                FolioTransaction(
+                    transaction_id=f"{reservation_id}_base_0",
+                    type="invoice_item",
+                    description="基本料金",
+                    debit=float(nightly),
+                    credit=0.0,
+                    display_date=date.today(),
+                )
+            )
+            total_debit += nightly
+            first_date = date.today()
+
+        sauna_fee = 5000.0
+        transactions.append(
             FolioTransaction(
-                transaction_id=f"{reservation_id}_t1",
-                type="invoice_item",
-                description=f"Accommodation R{seed % 1000000:06d}",
-                debit=float(nightly),
-                credit=0.0,
-                display_date=date.today(),
-            ),
-            FolioTransaction(
-                transaction_id=f"{reservation_id}_t2",
+                transaction_id=f"{reservation_id}_sauna",
                 type="invoice_item",
                 description=f"1 x Sauna② R{(seed + 1) % 1000000:06d}",
-                debit=5000.0,
+                debit=sauna_fee,
                 credit=0.0,
-                display_date=date.today(),
-            ),
+                display_date=first_date,
+            )
+        )
+        total_debit += sauna_fee
+
+        transactions.append(
             FolioTransaction(
-                transaction_id=f"{reservation_id}_t3",
+                transaction_id=f"{reservation_id}_payment",
                 type="payment",
                 description="現地クレジット決済",
                 debit=0.0,
-                credit=float(nightly + 5000),
-                display_date=date.today(),
+                credit=total_debit,
+                display_date=first_date,
                 state="completed",
-            ),
-        ]
-        total = float(nightly + 5000)
+            )
+        )
+
         return [
             Folio(
                 folio_id=f"folio_{reservation_id}",
                 booking_id=reservation_id,
                 title=f"Mock Folio — {reservation_id[:8]}",
-                total_debit=total,
-                total_credit=total,
+                total_debit=total_debit,
+                total_credit=total_debit,
                 balance=0.0,
                 currency="JPY",
                 closed=False,
-                transactions=extras,
+                transactions=transactions,
             )
         ]
