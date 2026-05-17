@@ -60,7 +60,9 @@ class RoomTypeAvailability(BaseModel):
     name: str
     total_units: int
     available_units: int
-    nightly_rate_jpy: int | None = None
+    nightly_rate_jpy: int | None = None  # 基本料金 (date-specific, seasonal)
+    extra_guest_price_jpy: int | None = None  # 人数料金: charged per guest above guests_included
+    guests_included: int | None = None  # guests covered by nightly_rate_jpy
 
 
 class Availability(BaseModel):

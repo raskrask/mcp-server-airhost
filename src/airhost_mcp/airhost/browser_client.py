@@ -462,6 +462,56 @@ class BrowserAirhostClient(AirhostClient):
             )
         return out
 
+    async def _fetch_rate_plans(
+        self, page: Page, house_id: str, room_type_id: str
+    ) -> list[dict[str, Any]]:
+        """Fetch rate plans for a room type via /cm/rate_plans."""
+        url = (
+            f"{self._API_BASE}/cm/rate_plans"
+            f"?locale=ja&no_pagination=true&house_id={house_id}&room_id={room_type_id}"
+        )
+        headers = await self._build_headers(page)
+        resp = await page.request.get(url, headers=headers)
+        if not resp.ok:
+            logger.warning("rate_plans HTTP %s for room_type %s", resp.status, room_type_id)
+            return []
+        payload = await resp.json()
+        return payload.get("data") or []
+
+    async def _fetch_date_prices(
+        self, page: Page, rate_plan_id: str, start_date: date, end_date: date
+    ) -> dict[str, int]:
+        """Fetch per-date selling prices from /pms/pricing_calendar/availabilities.
+
+        Returns a dict mapping ISO date string → price in JPY (the actual
+        seasonal/adjusted price, not the static min_price).
+        """
+        url = (
+            f"{self._API_BASE}/pms/pricing_calendar/availabilities"
+            f"?locale=ja"
+            f"&starts_at={start_date.isoformat()}"
+            f"&ends_at={end_date.isoformat()}"
+            f"&current={start_date.isoformat()}"
+            f"&rate_plan_id={rate_plan_id}"
+        )
+        headers = await self._build_headers(page)
+        resp = await page.request.get(url, headers=headers)
+        if not resp.ok:
+            logger.warning("pricing_calendar HTTP %s", resp.status)
+            return {}
+        payload = await resp.json()
+        if not payload.get("success"):
+            return {}
+        result: dict[str, int] = {}
+        for item in (payload.get("data", {}).get("availabilities") or []):
+            d = item.get("date")
+            p = item.get("price")
+            if d and p is not None:
+                v = _safe_int(p)
+                if v is not None:
+                    result[d] = v
+        return result
+
     async def get_availability(self, listing_id: str, target_date: date) -> Availability:
         """Per-RoomType availability for a single building on a single date.
 
@@ -488,13 +538,34 @@ class BrowserAirhostClient(AirhostClient):
             rt_avail: list[RoomTypeAvailability] = []
             for rt in room_types:
                 free = [u for u in rt.room_units if u.room_unit_id not in occupied]
+
+                # Fetch the primary rate plan to get date-specific price and
+                # person fee (extra_guest_price / guests_included).
+                date_price: int | None = rt.nightly_rate_jpy  # fallback
+                extra_guest_price: int | None = None
+                guests_included: int | None = None
+                try:
+                    rate_plans = await self._fetch_rate_plans(page, listing_id, rt.room_type_id)
+                    if rate_plans:
+                        rp = rate_plans[0]
+                        extra_guest_price = _safe_int(rp.get("extra_guest_price"))
+                        guests_included = _safe_int(rp.get("guests_included"))
+                        prices = await self._fetch_date_prices(
+                            page, rp["id"], target_date, target_date
+                        )
+                        date_price = prices.get(target_date.isoformat(), date_price)
+                except Exception as exc:
+                    logger.warning("date price fetch failed for %s: %s", rt.room_type_id, exc)
+
                 rt_avail.append(
                     RoomTypeAvailability(
                         room_type_id=rt.room_type_id,
                         name=rt.name,
                         total_units=len(rt.room_units),
                         available_units=len(free),
-                        nightly_rate_jpy=rt.nightly_rate_jpy,
+                        nightly_rate_jpy=date_price,
+                        extra_guest_price_jpy=extra_guest_price,
+                        guests_included=guests_included,
                     )
                 )
 
@@ -1068,8 +1139,18 @@ class BrowserAirhostClient(AirhostClient):
         out: list[Reservation] = []
         for room_type in payload.get("data", []) or []:
             rt_id = room_type.get("id")
+            logger.debug(
+                "booking_calendar room_type keys=%s non-unit-keys=%s",
+                list(room_type.keys()),
+                {k: v for k, v in room_type.items() if k not in ("room_units", "id")},
+            )
             for room_unit in room_type.get("room_units", []) or []:
                 ru_id = room_unit.get("id")
+                logger.debug(
+                    "booking_calendar room_unit keys=%s non-booking-keys=%s",
+                    list(room_unit.keys()),
+                    {k: v for k, v in room_unit.items() if k not in ("bookings", "id")},
+                )
                 for b in room_unit.get("bookings", []) or []:
                     out.append(_booking_to_reservation(b, house_id, rt_id, ru_id))
         return out
