@@ -42,6 +42,9 @@ from .base import (
     BlockResult,
     Folio,
     FolioTransaction,
+    GuestIdPhoto,
+    GuestRegistrant,
+    GuestRegistration,
     Listing,
     Reservation,
     ReservationUpdate,
@@ -100,6 +103,76 @@ def _parse_folio(f: dict[str, Any]) -> Folio:
         currency=f.get("currency", "JPY"),
         closed=bool(f.get("closed")),
         transactions=transactions,
+    )
+
+
+# Standard guest keys that may hold the ID image, tried after any
+# form-declared photo field. A local form on some accounts stores the ID
+# under a host-defined ``custom_*`` field instead of these.
+_STD_PHOTO_KEYS = ("photo", "ident_photo")
+
+
+def _extract_photo_url(guest: dict[str, Any], photo_field_ids: list[str]) -> str | None:
+    """Pull the first uploaded photo URL from a guest's submitted fields.
+
+    Photo field ids vary by form (the foreign form uses ``photo``; a local
+    form may use a host-defined ``custom_*`` field), so we try the form's
+    declared photo fields first, then fall back to the standard keys. Each
+    value is either null or an object like ``{"item_url": ".../blobs/..."}``.
+    """
+    for key in (*photo_field_ids, *_STD_PHOTO_KEYS):
+        val = guest.get(key)
+        if isinstance(val, dict) and val.get("item_url"):
+            return val["item_url"]
+    return None
+
+
+def _parse_guest_registration(booking_id: str, data: dict[str, Any]) -> GuestRegistration:
+    """Map the /pms/checkin/guest_forms payload to GuestRegistration.
+
+    The payload has two halves: ``forms`` (field definitions, used here only
+    to learn which field_id holds the photo per form) and ``guests`` (each
+    guest's submitted values). Guests link to a form via ``basic_form_id``.
+    """
+    photo_fields_by_form: dict[str, list[str]] = {}
+    for form in data.get("forms") or []:
+        fid = form.get("id")
+        if not fid:
+            continue
+        photo_fields_by_form[fid] = [
+            f["field_id"]
+            for f in (form.get("fields") or [])
+            if f.get("field_type") == "photo" and f.get("field_id")
+        ]
+
+    guests: list[GuestRegistrant] = []
+    for g in data.get("guests") or []:
+        photo_field_ids = photo_fields_by_form.get(g.get("basic_form_id"), [])
+        guests.append(
+            GuestRegistrant(
+                guest_id=g.get("id", ""),
+                name=g.get("name") or "",
+                is_main_guest=bool(g.get("is_main_guest")),
+                progress=_safe_int(g.get("progress")) or 0,
+                resident_status=g.get("resident_status"),
+                checkin_status=g.get("checkin_status"),
+                nationality=g.get("nationality"),
+                id_photo_url=_extract_photo_url(g, photo_field_ids),
+            )
+        )
+
+    guest_count = len(guests)
+    completed_count = sum(1 for g in guests if g.progress >= 100)
+    main = next((g for g in guests if g.is_main_guest), None)
+    return GuestRegistration(
+        booking_id=booking_id,
+        guest_count=guest_count,
+        completed_count=completed_count,
+        is_complete=guest_count > 0 and completed_count == guest_count,
+        overall_progress=min((g.progress for g in guests), default=0),
+        main_guest_name=main.name if main else None,
+        main_guest_id_photo_url=main.id_photo_url if main else None,
+        guests=guests,
     )
 
 
@@ -624,6 +697,89 @@ class BrowserAirhostClient(AirhostClient):
             }
             payload = await self._api_post(page, url, body)
             return [_parse_folio(f) for f in (payload.get("data") or [])]
+
+    async def _fetch_guest_registration(
+        self, page: Page, booking_id: str
+    ) -> GuestRegistration:
+        """GET /pms/checkin/guest_forms and parse it into GuestRegistration."""
+        url = (
+            f"{self._API_BASE}/pms/checkin/guest_forms"
+            f"?locale=ja&booking_id={booking_id}"
+            "&include_nationality_options=false"
+        )
+        headers = await self._build_headers(page)
+        resp = await page.request.get(url, headers=headers)
+        if not resp.ok:
+            raise RuntimeError(
+                f"guest_forms API HTTP {resp.status}: {(await resp.text())[:300]}"
+            )
+        payload = await resp.json()
+        if not payload.get("success"):
+            raise RuntimeError(f"guest_forms API failed: {payload}")
+        return _parse_guest_registration(booking_id, payload.get("data") or {})
+
+    async def get_guest_registration(self, booking_id: str) -> GuestRegistration:
+        """Online check-in (宿泊者名簿) status + ID document for one booking.
+
+        Hits /pms/checkin/guest_forms, which returns the form definitions and
+        every guest's submitted values. Returns personal data.
+        """
+        async with self._page() as page:
+            return await self._fetch_guest_registration(page, booking_id)
+
+    async def get_guest_id_photo(
+        self, booking_id: str, guest_id: str | None = None
+    ) -> GuestIdPhoto:
+        """Download a guest's ID document image (本人確認書類) as raw bytes.
+
+        Resolves the photo URL via the guest forms, then fetches the Airhost
+        blob using the logged-in session (cookies travel on ``page.request``).
+        ``guest_id`` defaults to the representative (main guest).
+        """
+        async with self._page() as page:
+            reg = await self._fetch_guest_registration(page, booking_id)
+            if guest_id is None:
+                target = next((g for g in reg.guests if g.is_main_guest), None)
+                if target is None:
+                    raise RuntimeError(
+                        f"booking {booking_id} has no main guest to read an ID from"
+                    )
+            else:
+                target = next((g for g in reg.guests if g.guest_id == guest_id), None)
+                if target is None:
+                    raise RuntimeError(
+                        f"guest {guest_id} not found on booking {booking_id}"
+                    )
+
+            if not target.id_photo_url:
+                raise RuntimeError(
+                    f"guest {target.guest_id} ({target.name}) has no ID document on file"
+                )
+            # Defense in depth: only ever fetch from Airhost's own blob host,
+            # so this method can't be turned into an authenticated open proxy.
+            if not target.id_photo_url.startswith("https://api2.airhost.co/"):
+                raise RuntimeError(
+                    f"refusing to fetch non-Airhost URL: {target.id_photo_url}"
+                )
+
+            img_resp = await page.request.get(target.id_photo_url)
+            if not img_resp.ok:
+                raise RuntimeError(
+                    f"ID photo fetch HTTP {img_resp.status} for {target.id_photo_url}"
+                )
+            content = await img_resp.body()
+            mime = (
+                (img_resp.headers.get("content-type") or "application/octet-stream")
+                .split(";")[0]
+                .strip()
+            )
+            return GuestIdPhoto(
+                booking_id=booking_id,
+                guest_id=target.guest_id,
+                guest_name=target.name,
+                mime=mime,
+                content=content,
+            )
 
     async def list_reservations_in_range(
         self,

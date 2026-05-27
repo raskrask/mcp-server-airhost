@@ -122,6 +122,60 @@ class Folio(BaseModel):
     transactions: list[FolioTransaction] = Field(default_factory=list)
 
 
+class GuestRegistrant(BaseModel):
+    """One guest's online check-in (宿泊者名簿) entry.
+
+    Holds personal data. ``progress`` is Airhost's own 0–100 completion for
+    this guest. The ID document image (本人確認書類) is only collected from
+    the representative (``is_main_guest``), so ``id_photo_url`` is None for
+    the others. ``id_photo_url`` points at an authenticated Airhost blob —
+    fetching it needs the logged-in session, so the URL is not usable by an
+    unauthenticated client.
+    """
+
+    guest_id: str
+    name: str
+    is_main_guest: bool = False
+    progress: int = 0  # 0–100, Airhost-computed
+    resident_status: str | None = None  # "local" | "foreign"
+    checkin_status: str | None = None  # e.g. "before_checkin"
+    nationality: str | None = None
+    id_photo_url: str | None = None  # representative only; needs auth to fetch
+
+
+class GuestRegistration(BaseModel):
+    """Booking-level rollup of guest online check-in status.
+
+    ``is_complete`` is the gate for "all guest info submitted" (every guest
+    at progress 100) — the signal used to decide key handover. Holds personal
+    data via ``guests`` and ``main_guest_*``.
+    """
+
+    booking_id: str
+    guest_count: int
+    completed_count: int
+    is_complete: bool
+    overall_progress: int  # min progress across guests (0 when no guests)
+    main_guest_name: str | None = None
+    main_guest_id_photo_url: str | None = None
+    guests: list[GuestRegistrant] = Field(default_factory=list)
+
+
+class GuestIdPhoto(BaseModel):
+    """Raw bytes of a guest's ID document image (本人確認書類).
+
+    Returned by ``get_guest_id_photo`` so the image can be handed to a vision
+    model. The bytes are personal data — do not persist them. ``content`` is
+    the raw blob; ``mime`` is its Content-Type as reported by Airhost.
+    """
+
+    booking_id: str
+    guest_id: str
+    guest_name: str
+    mime: str
+    content: bytes
+
+
 class BlockResult(BaseModel):
     listing_id: str
     target_date: date
@@ -202,5 +256,27 @@ class AirhostClient(ABC):
 
         Each transaction has a ``type`` of "invoice_item" (charges) or
         "payment" and a free-text ``description`` (e.g. "1 x Sauna② R971…").
+        """
+        ...
+
+    @abstractmethod
+    async def get_guest_registration(self, booking_id: str) -> GuestRegistration:
+        """Return online check-in (宿泊者名簿) status for one booking.
+
+        Includes each guest's completion progress and the representative's
+        ID document image URL. Returns personal data.
+        """
+        ...
+
+    @abstractmethod
+    async def get_guest_id_photo(
+        self, booking_id: str, guest_id: str | None = None
+    ) -> GuestIdPhoto:
+        """Download a guest's ID document image (本人確認書類) as raw bytes.
+
+        Resolves the photo URL from the booking's guest forms and fetches the
+        authenticated Airhost blob. ``guest_id`` defaults to the representative
+        (main guest), who is normally the only one with an ID on file.
+        Returns personal data.
         """
         ...

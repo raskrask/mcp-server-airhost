@@ -8,6 +8,7 @@ always returns the same fake reservation. This keeps testing predictable.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from datetime import date, timedelta
 
@@ -17,12 +18,21 @@ from .base import (
     BlockResult,
     Folio,
     FolioTransaction,
+    GuestIdPhoto,
+    GuestRegistrant,
+    GuestRegistration,
     Listing,
     Reservation,
     ReservationUpdate,
     RoomType,
     RoomTypeAvailability,
     RoomUnit,
+)
+
+# A 1x1 transparent PNG — valid image bytes so the Image content path works
+# end to end in tests without shipping a real (PII) document.
+_MOCK_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 )
 
 # Deterministic mock data covering the House > RoomType > RoomUnit hierarchy.
@@ -271,6 +281,76 @@ class MockAirhostClient(AirhostClient):
     ) -> list[Reservation]:
         """Mock: same as list_reservations_in_range (no CSV export in mock)."""
         return await self.list_reservations_in_range(listing_id, start_date, end_date)
+
+    async def get_guest_registration(self, booking_id: str) -> GuestRegistration:
+        """Deterministic dummy 宿泊者名簿. No real PII — safe for testing.
+
+        Seeded off booking_id so the same id always yields the same shape.
+        The representative (first guest) always has an ID photo URL; some
+        non-main guests are left incomplete so the ``is_complete`` gate can
+        be exercised both ways.
+        """
+        seed = int(hashlib.sha256(booking_id.encode()).hexdigest()[:8], 16)
+        n = 1 + (seed % 4)
+        is_foreign = seed % 3 == 0
+        guests: list[GuestRegistrant] = []
+        for i in range(n):
+            is_main = i == 0
+            # Main guest always complete; others toggle by seed bit.
+            progress = 100 if (is_main or (seed >> i) & 1) else 60
+            guests.append(
+                GuestRegistrant(
+                    guest_id=f"{booking_id}_g{i}",
+                    name=f"Guest #{(seed + i) % 1000:03d}",
+                    is_main_guest=is_main,
+                    progress=progress,
+                    resident_status="foreign" if is_foreign else "local",
+                    checkin_status="before_checkin",
+                    nationality="US" if is_foreign else "JP",
+                    id_photo_url=(
+                        f"https://api2.airhost.co/blobs/mock-{booking_id}"
+                        if is_main
+                        else None
+                    ),
+                )
+            )
+        completed = sum(1 for g in guests if g.progress >= 100)
+        main = guests[0]
+        return GuestRegistration(
+            booking_id=booking_id,
+            guest_count=n,
+            completed_count=completed,
+            is_complete=completed == n,
+            overall_progress=min(g.progress for g in guests),
+            main_guest_name=main.name,
+            main_guest_id_photo_url=main.id_photo_url,
+            guests=guests,
+        )
+
+    async def get_guest_id_photo(
+        self, booking_id: str, guest_id: str | None = None
+    ) -> GuestIdPhoto:
+        """Return a deterministic dummy ID image (1x1 PNG). No real PII."""
+        reg = await self.get_guest_registration(booking_id)
+        if guest_id is None:
+            target = next((g for g in reg.guests if g.is_main_guest), None)
+            if target is None:
+                raise ValueError(f"booking {booking_id} has no main guest")
+        else:
+            target = next((g for g in reg.guests if g.guest_id == guest_id), None)
+            if target is None:
+                raise ValueError(f"guest {guest_id} not found on booking {booking_id}")
+        if not target.id_photo_url:
+            raise ValueError(
+                f"guest {target.guest_id} ({target.name}) has no ID document on file"
+            )
+        return GuestIdPhoto(
+            booking_id=booking_id,
+            guest_id=target.guest_id,
+            guest_name=target.name,
+            mime="image/png",
+            content=_MOCK_PNG,
+        )
 
     async def get_folio(self, reservation_id: str) -> list[Folio]:
         seed = int(hashlib.sha256(reservation_id.encode()).hexdigest()[:8], 16)
