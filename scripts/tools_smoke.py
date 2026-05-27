@@ -6,6 +6,8 @@ Usage:
     .venv/bin/python -m scripts.tools_smoke get_reservations_on <listing_id> 2026-05-01
     .venv/bin/python -m scripts.tools_smoke list_reservations_in_range 2026-05-01 2026-05-31
     .venv/bin/python -m scripts.tools_smoke list_reservations_in_range 2026-05-01 2026-05-31 <listing_id>
+    .venv/bin/python -m scripts.tools_smoke get_guest_registration <booking_id>
+    .venv/bin/python -m scripts.tools_smoke get_guest_id_photo <booking_id> [guest_id]
 
 Reuses the persisted Playwright session from .sessions/, so login is
 skipped when the storage_state is still fresh.
@@ -68,6 +70,17 @@ async def _run(tool: str, args: list[str]) -> int:
             result = await client.list_reservations_in_range(
                 listing_id, date.fromisoformat(args[0]), date.fromisoformat(args[1])
             )
+        elif tool == "get_guest_registration":
+            result = await client.get_guest_registration(args[0])
+        elif tool == "get_guest_id_photo":
+            guest_id = args[1] if len(args) > 1 else None
+            photo = await client.get_guest_id_photo(args[0], guest_id)
+            # Don't dump raw image bytes; print metadata + size only.
+            print(
+                f"\n✅ {tool}: guest={photo.guest_name!r} guest_id={photo.guest_id} "
+                f"mime={photo.mime} bytes={len(photo.content)}"
+            )
+            return 0
         elif tool == "block_date":
             reason = args[2] if len(args) > 2 else None
             result = await client.block_date(

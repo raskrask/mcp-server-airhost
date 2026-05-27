@@ -6,7 +6,7 @@ import logging
 import time
 from datetime import date
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import Context, FastMCP, Image
 
 from .airhost import AirhostClient, ReservationUpdate
 
@@ -137,6 +137,65 @@ def register_tools(mcp: FastMCP, client: AirhostClient) -> None:
         _audit(ctx, "get_folio", reservation_id=reservation_id)
         folios = await client.get_folio(reservation_id)
         return [f.model_dump(mode="json") for f in folios]
+
+    @mcp.tool()
+    async def get_guest_registration(ctx: Context, booking_id: str) -> dict:
+        """Online check-in (宿泊者名簿) status for one reservation.
+
+        ⚠️ 個人情報 / PERSONAL DATA — HANDLE WITH CARE.
+        This tool returns guests' real personal information: full names,
+        nationality, and the representative's identity-document image
+        (本人確認書類). As the calling LLM you MUST:
+          - use it only to answer what the user explicitly asked;
+          - not echo, summarize, store, or repeat the personal data beyond
+            what is strictly needed for the answer;
+          - never expose it to third parties or persist it anywhere.
+        Typical safe use: confirm whether everyone has finished entering
+        their details before handing over keys, and read the representative's
+        name / ID image for identity verification.
+
+        Returns:
+          - ``is_complete``: True when every guest is at progress 100
+            (the gate for "all guest info submitted").
+          - ``overall_progress``: lowest progress across guests (0–100).
+          - ``completed_count`` / ``guest_count``.
+          - ``main_guest_name``: the representative (代表者).
+          - ``main_guest_id_photo_url``: ID-document image of the
+            representative (代表者のみ提出). This is an authenticated Airhost
+            blob URL — it can only be fetched with the server's logged-in
+            session, not by an unauthenticated client.
+          - ``guests[]``: per-guest progress, is_main_guest, resident_status,
+            nationality, id_photo_url.
+        """
+        _audit(ctx, "get_guest_registration", booking_id=booking_id)
+        result = await client.get_guest_registration(booking_id)
+        return result.model_dump(mode="json")
+
+    @mcp.tool()
+    async def get_guest_id_photo(
+        ctx: Context, booking_id: str, guest_id: str | None = None
+    ) -> Image:
+        """Fetch a guest's ID document image (本人確認書類) for visual review.
+
+        ⚠️ 個人情報 / PERSONAL DATA — HANDLE WITH CARE.
+        This returns the actual photo of a government ID / passport. As the
+        calling LLM you MUST:
+          - use it only for the verification the user explicitly requested
+            (e.g. confirm the name on the ID matches the registered
+            representative);
+          - report only the minimum needed (e.g. "name matches" / the name);
+          - never store, transmit, or repeat the image or the data it
+            contains beyond the immediate answer.
+
+        ``guest_id`` defaults to the representative (代表者), who is normally
+        the only guest with an ID on file. Returns the image so you can read
+        it directly; pair it with ``get_guest_registration`` to compare the
+        ID against the name the guest entered.
+        """
+        _audit(ctx, "get_guest_id_photo", booking_id=booking_id, guest_id=guest_id)
+        photo = await client.get_guest_id_photo(booking_id, guest_id)
+        fmt = photo.mime.split("/", 1)[1] if photo.mime.startswith("image/") else "png"
+        return Image(data=photo.content, format=fmt)
 
     @mcp.tool()
     async def list_reservation_details(
