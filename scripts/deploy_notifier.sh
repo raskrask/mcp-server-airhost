@@ -46,13 +46,17 @@ rm -f "${TMPCONFIG}"
 
 echo "=== Creating / updating Cloud Run Job ==="
 
-ENV_VARS="MCP_PUBLIC_URL=${MCP_PUBLIC_URL}"
-ENV_VARS+=",MCP_CLIENT_ID=${MCP_CLIENT_ID}"
-ENV_VARS+=",LISTING_IDS=${LISTING_IDS}"
-ENV_VARS+=",LINE_USER_IDS=${LINE_USER_IDS}"
-ENV_VARS+=",GCS_BUCKET=${GCS_BUCKET}"
-ENV_VARS+=",GCS_NOTIFIER_PREFIX=${GCS_NOTIFIER_PREFIX}"
-ENV_VARS+=",LOOKAHEAD_DAYS=${LOOKAHEAD_DAYS}"
+TMPENV=$(mktemp /tmp/envvars_XXXXXX.yaml)
+cat > "${TMPENV}" <<ENVEOF
+MCP_PUBLIC_URL: ${MCP_PUBLIC_URL}
+MCP_CLIENT_ID: ${MCP_CLIENT_ID}
+LISTING_IDS: ${LISTING_IDS}
+LINE_USER_IDS: ${LINE_USER_IDS}
+GCS_BUCKET: ${GCS_BUCKET}
+GCS_NOTIFIER_PREFIX: ${GCS_NOTIFIER_PREFIX}
+LOOKAHEAD_DAYS: "${LOOKAHEAD_DAYS}"
+LOG_LEVEL: ${LOG_LEVEL:-INFO}
+ENVEOF
 
 SECRETS="LINE_CHANNEL_TOKEN=LINE_CHANNEL_TOKEN:latest"
 SECRETS+=",MCP_CLIENT_SECRET=MCP_CLIENT_SECRET:latest"
@@ -64,7 +68,7 @@ JOB_ARGS=(
   --project "${PROJECT_ID}"
   --max-retries 1
   --task-timeout 600
-  --set-env-vars "${ENV_VARS}"
+  --env-vars-file "${TMPENV}"
   --set-secrets "${SECRETS}"
 )
 
@@ -77,6 +81,7 @@ if gcloud run jobs describe "${JOB}" --region "${REGION}" --project "${PROJECT_I
 else
   gcloud run jobs create "${JOB_ARGS[@]}"
 fi
+rm -f "${TMPENV}"
 
 echo "=== Creating / updating Cloud Scheduler ==="
 
