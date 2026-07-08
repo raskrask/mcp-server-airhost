@@ -374,20 +374,24 @@ mcp-server-airhost/
 ## 宿泊者名簿 完了通知（notifier）
 
 `notifier/` は MCP サーバーとは独立した **Cloud Run Job** として動作する。
-Cloud Scheduler から1日1回起動し、対象リスティングの未来予約を走査して
+Cloud Scheduler から2種類のジョブで起動し、対象リスティングの未来予約を走査して
 宿泊者名簿（オンラインチェックイン）が 100% 完了した予約を LINE に通知する。
+チェックイン間近でまだ未完了の予約には、朝の実行時に催促通知も送る（未完了の間は毎回送るため状態は保存しない）。
+
+- `<job>-trigger-reminder`（デフォルト 9時 JST）: 完了通知に加え、チェックイン `REMINDER_DAYS_BEFORE` 日前以内で未完了の予約に催促通知（`REMINDER_RUN=true`）
+- `<job>-trigger`（デフォルト 12,15,18,21時 JST）: 完了通知のみ（`REMINDER_RUN=false`）
 
 ### 動作フロー
 
 ```
-Cloud Scheduler (毎朝9時 JST)
-    ↓
+Cloud Scheduler (9時=催促あり / 12,15,18,21時=完了通知のみ, JST)
+    ↓ overrides.containerOverrides.env で REMINDER_RUN を実行ごとに指定
 Cloud Run Job: airhost-notifier   ← python:3.11-slim（Playwright 不要・軽量）
     ↓ Bearer token (MCP_ACCESS_TOKEN)
 MCP サーバー（既存 Cloud Run）
     ↓ get_guest_registration / list_reservations_in_range
 通知済みフラグ: gs://<bucket>/airhost-notifier/notified/<reservation_id>.json
-    ↓ 未通知 & is_complete=true の予約のみ
+    ↓ is_complete=true & 未通知 → 完了通知（送信後フラグ保存） / 未完了 & REMINDER_RUN & チェックインN日前以内 → 催促通知（毎回送信、状態は保存しない）
 LINE Messaging API → 対象ユーザー全員に push
 ```
 
@@ -403,6 +407,8 @@ LINE Messaging API → 対象ユーザー全員に push
 | `GCS_BUCKET` | 通知フラグ保存先バケット（MCPサーバーと同一可） |
 | `GCS_NOTIFIER_PREFIX` | GCS内のプレフィックス（デフォルト: `airhost-notifier/notified/`） |
 | `LOOKAHEAD_DAYS` | 何日先の予約まで対象にするか（デフォルト: 60） |
+| `REMINDER_RUN` | 未完了予約への催促通知も行うか（デフォルト: `false`。`trigger-reminder` ジョブが `true` を渡す） |
+| `REMINDER_DAYS_BEFORE` | チェックイン何日前から催促するか（デフォルト: 0＝当日のみ） |
 
 ### セットアップ
 
@@ -423,6 +429,13 @@ SERVICE_ACCOUNT=airhost-mcp-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com \
 
 # 3. 手動実行でテスト
 gcloud run jobs execute airhost-notifier --region asia-northeast1
+```
+
+このリポジトリでは上記の値を手打ちする代わりに、**リポジトリ直下の`.env`（PROJECT_ID/SESSION_GCS_BUCKET/MCP_PUBLIC_URLなど）と`notifier/.env`（LISTING_IDS/LINE_USER_IDS/LINE_CHANNEL_TOKENなど）の両方をsourceしてから**`./scripts/deploy_notifier.sh`を実行する運用にしている。
+
+```bash
+set -a && source .env && source notifier/.env && set +a
+./scripts/deploy_notifier.sh
 ```
 
 ### LINE 通知フォーマット
