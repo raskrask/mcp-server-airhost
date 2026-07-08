@@ -374,13 +374,13 @@ mcp-server-airhost/
 ## 宿泊者名簿 完了通知（notifier）
 
 `notifier/` は MCP サーバーとは独立した **Cloud Run Job** として動作する。
-Cloud Scheduler から1日1回起動し、対象リスティングの未来予約を走査して
+Cloud Scheduler から9〜21時の3時間ごとに起動し、対象リスティングの未来予約を走査して
 宿泊者名簿（オンラインチェックイン）が 100% 完了した予約を LINE に通知する。
 
 ### 動作フロー
 
 ```
-Cloud Scheduler (毎朝9時 JST)
+Cloud Scheduler (9-21時の3時間ごと JST)
     ↓
 Cloud Run Job: airhost-notifier   ← python:3.11-slim（Playwright 不要・軽量）
     ↓ Bearer token (MCP_ACCESS_TOKEN)
