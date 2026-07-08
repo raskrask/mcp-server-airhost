@@ -95,22 +95,21 @@ NORMAL_BODY='{"overrides":{"containerOverrides":[{"env":[{"name":"REMINDER_RUN",
 
 create_or_update_scheduler() {
   local name="$1" schedule="$2" body="$3"
-  local args=(
+  local common_args=(
     "${name}"
     --schedule "${schedule}"
     --time-zone "Asia/Tokyo"
     --uri "${RUN_URI}"
     --http-method POST
-    --headers "Content-Type=application/json"
     --message-body "${body}"
     --oauth-service-account-email "${OAUTH_SA}"
     --location "${REGION}"
     --project "${PROJECT_ID}"
   )
   if gcloud scheduler jobs describe "${name}" --location "${REGION}" --project "${PROJECT_ID}" &>/dev/null; then
-    gcloud scheduler jobs update http "${args[@]}"
+    gcloud scheduler jobs update http "${common_args[@]}" --update-headers "Content-Type=application/json"
   else
-    gcloud scheduler jobs create http "${args[@]}"
+    gcloud scheduler jobs create http "${common_args[@]}" --headers "Content-Type=application/json"
   fi
 }
 

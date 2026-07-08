@@ -431,6 +431,13 @@ SERVICE_ACCOUNT=airhost-mcp-runner@YOUR_PROJECT_ID.iam.gserviceaccount.com \
 gcloud run jobs execute airhost-notifier --region asia-northeast1
 ```
 
+このリポジトリでは上記の値を手打ちする代わりに、**リポジトリ直下の`.env`（PROJECT_ID/SESSION_GCS_BUCKET/MCP_PUBLIC_URLなど）と`notifier/.env`（LISTING_IDS/LINE_USER_IDS/LINE_CHANNEL_TOKENなど）の両方をsourceしてから**`./scripts/deploy_notifier.sh`を実行する運用にしている。
+
+```bash
+set -a && source .env && source notifier/.env && set +a
+./scripts/deploy_notifier.sh
+```
+
 ### LINE 通知フォーマット
 
 ```
