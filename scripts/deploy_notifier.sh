@@ -25,7 +25,8 @@ MCP_PUBLIC_URL="${MCP_PUBLIC_URL:?MCP_PUBLIC_URL env var required}"
 MCP_CLIENT_ID="${MCP_CLIENT_ID:-airhost-mcp}"
 LISTING_IDS="${LISTING_IDS:?LISTING_IDS env var required (comma-separated)}"
 LINE_USER_IDS="${LINE_USER_IDS:?LINE_USER_IDS env var required (comma-separated)}"
-SCHEDULE="${NOTIFIER_SCHEDULE:-0 9-21/3 * * *}"   # デフォルト: 9-21時の3時間ごと JST
+REMINDER_SCHEDULE="${NOTIFIER_REMINDER_SCHEDULE:-0 9 * * *}"          # 当日未完了への催促あり
+NORMAL_SCHEDULE="${NOTIFIER_NORMAL_SCHEDULE:-0 12,15,18,21 * * *}"     # 完了通知のみ（催促なし）
 SERVICE_ACCOUNT="${SERVICE_ACCOUNT:-}"
 LOOKAHEAD_DAYS="${LOOKAHEAD_DAYS:-60}"
 GCS_NOTIFIER_PREFIX="${GCS_NOTIFIER_PREFIX:-airhost-notifier/notified/}"
@@ -85,25 +86,36 @@ rm -f "${TMPENV}"
 
 echo "=== Creating / updating Cloud Scheduler ==="
 
-JOB_RESOURCE="projects/${PROJECT_ID}/locations/${REGION}/jobs/${JOB}"
-SCHEDULER_NAME="${JOB}-trigger"
+RUN_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB}:run"
+OAUTH_SA="${SERVICE_ACCOUNT:-$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')-compute@developer.gserviceaccount.com}"
 
-SCHEDULER_ARGS=(
-  "${SCHEDULER_NAME}"
-  --schedule "${SCHEDULE}"
-  --time-zone "Asia/Tokyo"
-  --uri "https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT_ID}/jobs/${JOB}:run"
-  --http-method POST
-  --oauth-service-account-email "${SERVICE_ACCOUNT:-$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')-compute@developer.gserviceaccount.com}"
-  --location "${REGION}"
-  --project "${PROJECT_ID}"
-)
+# Cloud Run Jobs の RunJobRequest.overrides で実行ごとに REMINDER_RUN を上書きする
+REMINDER_BODY='{"overrides":{"containerOverrides":[{"env":[{"name":"REMINDER_RUN","value":"true"}]}]}}'
+NORMAL_BODY='{"overrides":{"containerOverrides":[{"env":[{"name":"REMINDER_RUN","value":"false"}]}]}}'
 
-if gcloud scheduler jobs describe "${SCHEDULER_NAME}" --location "${REGION}" --project "${PROJECT_ID}" &>/dev/null; then
-  gcloud scheduler jobs update http "${SCHEDULER_ARGS[@]}"
-else
-  gcloud scheduler jobs create http "${SCHEDULER_ARGS[@]}"
-fi
+create_or_update_scheduler() {
+  local name="$1" schedule="$2" body="$3"
+  local args=(
+    "${name}"
+    --schedule "${schedule}"
+    --time-zone "Asia/Tokyo"
+    --uri "${RUN_URI}"
+    --http-method POST
+    --headers "Content-Type=application/json"
+    --message-body "${body}"
+    --oauth-service-account-email "${OAUTH_SA}"
+    --location "${REGION}"
+    --project "${PROJECT_ID}"
+  )
+  if gcloud scheduler jobs describe "${name}" --location "${REGION}" --project "${PROJECT_ID}" &>/dev/null; then
+    gcloud scheduler jobs update http "${args[@]}"
+  else
+    gcloud scheduler jobs create http "${args[@]}"
+  fi
+}
+
+create_or_update_scheduler "${JOB}-trigger-reminder" "${REMINDER_SCHEDULE}" "${REMINDER_BODY}"
+create_or_update_scheduler "${JOB}-trigger" "${NORMAL_SCHEDULE}" "${NORMAL_BODY}"
 
 echo
 echo "=== Done ==="
